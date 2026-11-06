@@ -3,7 +3,7 @@ import type { CSSProperties, FormEvent } from 'react'
 import { MapContainer, TileLayer, CircleMarker, Popup, useMap, useMapEvents } from 'react-leaflet'
 import { latLngBounds } from 'leaflet'
 import { createClient } from '@supabase/supabase-js'
-import { Activity, AlertCircle, ArrowDown, ArrowUpRight, Check, ChevronDown, CircleDot, Crosshair, Filter, LocateFixed, MapPin, Plus, Radio, X } from 'lucide-react'
+import { Activity, AlertCircle, ArrowDown, ArrowUpRight, Check, ChevronDown, CircleDot, ClipboardList, Crosshair, Filter, LocateFixed, MapPin, Plus, Radio, X } from 'lucide-react'
 
 type IssueType = 'pothole' | 'streetlight' | 'construction' | 'sidewalk'
 type Severity = 'low' | 'medium' | 'high'
@@ -83,9 +83,20 @@ function issueLabel(issueType: IssueType) {
 function statusLabel(status: ReportStatus) {
   return {
     open: 'Open',
-    'in-progress': 'In progress',
+    'in-progress': 'In-progress',
     resolved: 'Resolved',
   }[status]
+}
+
+function reportAgeLabel(report: Report) {
+  const createdTime = Date.parse(report.created_at)
+  if (!Number.isFinite(createdTime)) return ''
+
+  const ageInDays = Math.max(0, (Date.now() - createdTime) / (24 * 60 * 60 * 1000))
+  if (ageInDays <= 7) return '1 week'
+  if (ageInDays < 30) return 'under a month'
+  if (ageInDays < 180) return 'under 6 months'
+  return '6+ months to a year'
 }
 
 function sourceLabel(source: ReportSource) {
@@ -275,7 +286,7 @@ function RecenterButton() {
       type="button"
       aria-label="Recenter map on Sacramento"
       title="Recenter map"
-      onClick={() => map.flyTo([38.5816, -121.4944], 13, { duration: 0.8 })}
+      onClick={() => map.setView([38.5816, -121.4944], 13, { animate: false })}
     >
       <Crosshair size={17} />
     </button>
@@ -301,9 +312,9 @@ function NearbyMapController({
         [location.latitude, location.longitude],
         ...reports.map((report) => [report.latitude, report.longitude] as [number, number]),
       ])
-      map.flyToBounds(bounds.pad(0.18), { maxZoom: 15, duration: 0.8 })
+      map.fitBounds(bounds.pad(0.18), { maxZoom: 15, animate: false })
     } else {
-      map.flyTo([location.latitude, location.longitude], 15, { duration: 0.8 })
+      map.setView([location.latitude, location.longitude], 15, { animate: false })
     }
   }, [active, location, map, reports])
 
@@ -325,6 +336,7 @@ function ReportMarker({ report }: { report: Report }) {
             <strong>{issueLabel(report.issue_type)}</strong>
             <span className={`popup-status ${report.status}`}>{statusLabel(report.status)}</span>
           </div>
+          {report.status !== 'resolved' && <span className="popup-age">{reportAgeLabel(report)}</span>}
           <p>{report.description}</p>
           <div className="popup-meta">
             <span>{sourceLabel(report.source)}</span>
@@ -346,6 +358,7 @@ function App() {
   const [typeFilter, setTypeFilter] = useState<IssueType | 'all'>('all')
   const [visibleIssueTypes, setVisibleIssueTypes] = useState<IssueType[]>(issueTypes)
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
+  const [showMyReports, setShowMyReports] = useState(false)
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [dateFilter, setDateFilter] = useState<DateFilter>('all')
   const [customStartDate, setCustomStartDate] = useState('')
@@ -457,7 +470,7 @@ function App() {
   const filteredReports = useMemo(() => reports.filter((report) =>
     (typeFilter === 'all' || report.issue_type === typeFilter) &&
     visibleIssueTypes.includes(report.issue_type) &&
-    (sourceFilter === 'all' || report.source === sourceFilter) &&
+    (showMyReports ? report.source === 'user' : sourceFilter === 'all' || report.source === sourceFilter) &&
     (statusFilter === 'all' || report.status === statusFilter) &&
     (dateFilter === 'all' ||
       (dateFilter === 'last-90-days' && Date.parse(report.created_at) >= Date.now() - LAST_90_DAYS_MS) ||
@@ -466,7 +479,7 @@ function App() {
         (!selectedCustomRangeError && isWithinCustomDateRange(report, customStartDate, customEndDate))
       ))) &&
     (!isNearMeActive || !nearMeLocation || distanceInKilometers(nearMeLocation, report) <= NEARBY_RADIUS_KM),
-  ), [reports, typeFilter, visibleIssueTypes, sourceFilter, statusFilter, dateFilter, customStartDate, customEndDate, selectedCustomRangeError, isNearMeActive, nearMeLocation])
+  ), [reports, typeFilter, visibleIssueTypes, sourceFilter, showMyReports, statusFilter, dateFilter, customStartDate, customEndDate, selectedCustomRangeError, isNearMeActive, nearMeLocation])
 
   const openCount = reports.filter((report) => report.status !== 'resolved').length
   const resolvedCount = reports.length - openCount
@@ -593,9 +606,9 @@ function App() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <a className="brand" href="/" aria-label="Common Ground home">
+        <a className="brand" href="/" aria-label="StreetScope home">
           <span className="brand-mark"><Activity size={19} strokeWidth={2.2} /></span>
-          <span className="brand-name">common<span>ground</span></span>
+          <span className="brand-name">Street<span>Scope</span></span>
           <span className="brand-divider" />
           <span className="brand-place">SACRAMENTO, CA</span>
         </a>
@@ -690,7 +703,10 @@ function App() {
               <div>
                 <label className="field-label" htmlFor="source-filter">SOURCE</label>
                 <div className="select-wrap">
-                  <select id="source-filter" value={sourceFilter} onChange={(event) => setSourceFilter(event.target.value as SourceFilter)}>
+                  <select id="source-filter" value={sourceFilter} onChange={(event) => {
+                    setSourceFilter(event.target.value as SourceFilter)
+                    setShowMyReports(false)
+                  }}>
                     <option value="all">All sources</option>
                     <option value="user">Community</option>
                     <option value="city-of-sacramento">City of Sacramento</option>
@@ -750,6 +766,50 @@ function App() {
               ))}
             </div>
             <div className="source-key"><span className="source-key-ring" /> Community report <span className="source-key-dot" /> City record</div>
+          </section>
+
+          <section className="my-reports-section" aria-labelledby="my-reports-title">
+            <div className="section-title-row">
+              <button
+                className={`my-reports-tab ${showMyReports ? 'active' : ''}`}
+                id="my-reports-title"
+                type="button"
+                aria-pressed={showMyReports}
+                onClick={() => {
+                  setShowMyReports((active) => !active)
+                  setSourceFilter(showMyReports ? 'all' : 'user')
+                }}
+              >
+                <ClipboardList size={15} /> MY REPORTS
+              </button>
+              <span className="result-count">{showMyReports ? filteredReports.length : userReports.length} {showMyReports ? 'SHOWN' : 'TOTAL'}</span>
+            </div>
+            {reportsLoading ? (
+              <div className="my-reports-empty"><span className="button-spinner" /> Loading reports</div>
+            ) : userReports.length === 0 ? (
+              <div className="my-reports-empty">
+                <span>No community reports yet.</span>
+                <button type="button" onClick={startPlacing}>Report an issue <ArrowUpRight size={12} /></button>
+              </div>
+            ) : (
+              <div className="my-reports-list">
+                {userReports.slice(0, 5).map((report) => (
+                  <div className="my-report-card" key={report.id}>
+                    <span className="my-report-dot" style={{ backgroundColor: issueColors[report.issue_type] }} />
+                    <div className="my-report-details">
+                      <div className="my-report-heading">
+                        <strong>{issueLabel(report.issue_type)}</strong>
+                        <span className={`my-report-status ${report.status}`}>{statusLabel(report.status)}</span>
+                      </div>
+                      {report.status !== 'resolved' && <span className="my-report-age">{reportAgeLabel(report)}</span>}
+                      <p>{report.description}</p>
+                      <span className="my-report-date">{new Date(report.created_at).toLocaleDateString()}</span>
+                    </div>
+                  </div>
+                ))}
+                {userReports.length > 5 && <span className="my-reports-more">Showing 5 of {userReports.length} reports</span>}
+              </div>
+            )}
           </section>
 
           {isPlacing && (
@@ -818,10 +878,6 @@ function App() {
             {cityError && <p className="data-error" role="alert">{cityError}</p>}
             {reportsError && <p className="data-error" role="alert">{reportsError}</p>}
             {cityReports.length > 0 && <span className="last-updated"><Radio size={11} /> {cityReports.length} public repair records loaded</span>}
-            <div className="footer-bottom">
-              <span>BUILT FOR THE BLOCK</span>
-              <span>01 <span className="footer-slash">/</span> 01</span>
-            </div>
           </div>
         </aside>
 
