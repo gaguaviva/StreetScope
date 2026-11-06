@@ -40,6 +40,8 @@ interface ArcGisFeatureCollection {
 }
 
 const CITY_LAYER_URL = 'https://services5.arcgis.com/54falWtcpty3V47Z/arcgis/rest/services/311_Repairs_WFL1/FeatureServer'
+const CITY_CACHE_KEY = 'sacramento-city-repair-cache'
+const CITY_CACHE_TTL_MS = 30 * 60 * 1000
 const LOCAL_STORAGE_KEY = 'sacramento-infrastructure-reports'
 const NEARBY_RADIUS_KM = 5
 const LAST_90_DAYS_MS = 90 * 24 * 60 * 60 * 1000
@@ -56,6 +58,7 @@ const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
 const supabase = supabaseUrl && supabaseAnonKey ? createClient(supabaseUrl, supabaseAnonKey) : null
 const cartoBasemapKey = import.meta.env.VITE_CARTO_BASEMAP_KEY?.trim()
 let locationRequest: Promise<Coordinates> | null = null
+let cityReportsRequest: Promise<Report[]> | null = null
 
 function isReportArray(value: unknown): value is Report[] {
   return Array.isArray(value) && value.every((item) =>
@@ -161,10 +164,11 @@ function coordinatesFor(feature: NonNullable<ArcGisFeatureCollection['features']
 async function fetchCityLayer(layer: number, signal: AbortSignal): Promise<Report[]> {
   const query = new URLSearchParams({
     where: '1=1',
-    outFields: 'OBJECTID,CategoryName,StatusType,DateCreated,DateUpdated,CrossStreet,Neighborhood',
+    outFields: 'OBJECTID,CategoryName,DateCreated,CrossStreet,Neighborhood',
     returnGeometry: 'true',
     outSR: '4326',
-    resultRecordCount: '250',
+    geometryPrecision: '5',
+    resultRecordCount: '100',
     orderByFields: 'DateUpdated DESC',
     f: 'geojson',
   })
@@ -208,6 +212,50 @@ async function fetchCityReports(signal: AbortSignal) {
     fetchCityLayer(1, signal),
   ])
   return [...potholes, ...streetLights]
+}
+
+function getCachedCityReports() {
+  try {
+    const cached: unknown = JSON.parse(localStorage.getItem(CITY_CACHE_KEY) || 'null')
+    if (
+      cached !== null &&
+      typeof cached === 'object' &&
+      'savedAt' in cached &&
+      typeof cached.savedAt === 'number' &&
+      Date.now() - cached.savedAt < CITY_CACHE_TTL_MS &&
+      'reports' in cached &&
+      isReportArray(cached.reports) &&
+      cached.reports.every((report) => report.source === 'city-of-sacramento')
+    ) {
+      return cached.reports
+    }
+  } catch (error) {
+    console.warn('Unable to read cached City of Sacramento reports.', error)
+  }
+  return null
+}
+
+function cacheCityReports(reports: Report[]) {
+  try {
+    localStorage.setItem(CITY_CACHE_KEY, JSON.stringify({ savedAt: Date.now(), reports }))
+  } catch (error) {
+    console.warn('Unable to cache City of Sacramento reports.', error)
+  }
+}
+
+function loadCityReports() {
+  if (!cityReportsRequest) {
+    const controller = new AbortController()
+    cityReportsRequest = fetchCityReports(controller.signal)
+      .then((reports) => {
+        cacheCityReports(reports)
+        return reports
+      })
+      .finally(() => {
+        cityReportsRequest = null
+      })
+  }
+  return cityReportsRequest
 }
 
 function MapClickHandler({ enabled, onSelect }: { enabled: boolean; onSelect: (latitude: number, longitude: number) => void }) {
@@ -337,18 +385,27 @@ function App() {
   }, [])
 
   useEffect(() => {
-    const controller = new AbortController()
-    fetchCityReports(controller.signal)
-      .then(setCityReports)
+    const cachedReports = getCachedCityReports()
+    if (cachedReports) {
+      setCityReports(cachedReports)
+      setCityLoading(false)
+      return
+    }
+
+    let active = true
+    loadCityReports()
+      .then((reports) => {
+        if (active) setCityReports(reports)
+      })
       .catch((error: unknown) => {
-        if (!controller.signal.aborted) {
+        if (active) {
           setCityError(error instanceof Error ? error.message : 'Unable to load City of Sacramento data.')
         }
       })
       .finally(() => {
-        if (!controller.signal.aborted) setCityLoading(false)
+        if (active) setCityLoading(false)
       })
-    return () => controller.abort()
+    return () => { active = false }
   }, [])
 
   useEffect(() => {
@@ -774,6 +831,7 @@ function App() {
             zoom={13}
             minZoom={10}
             maxZoom={19}
+            preferCanvas
             scrollWheelZoom
             className={isPlacing ? 'leaflet-map placing' : 'leaflet-map'}
             zoomControl={false}
