@@ -3,7 +3,7 @@ import type { CSSProperties, FormEvent, PointerEvent as ReactPointerEvent } from
 import { MapContainer, TileLayer, CircleMarker, Marker, Popup, useMap, useMapEvents } from 'react-leaflet'
 import { divIcon, latLngBounds } from 'leaflet'
 import { createClient } from '@supabase/supabase-js'
-import { Activity, AlertCircle, ArrowDown, ArrowUpRight, Check, ChevronDown, Crosshair, Filter, LocateFixed, MapPin, Plus, Radio, Search, X } from 'lucide-react'
+import { AlertCircle, ArrowDown, ArrowUpRight, ChevronDown, Crosshair, Filter, LocateFixed, MapPin, Plus, Radio, Search, X } from 'lucide-react'
 import { appConfig } from './config'
 
 type IssueType =
@@ -43,6 +43,7 @@ interface Report {
   created_at: string
   address?: string
   external_id?: string | null
+  confirmation_count?: number
 }
 
 interface ArcGisFeatureCollection {
@@ -59,6 +60,9 @@ const LEGACY_CITY_LAYER_URL = appConfig.legacyCityLayerUrl
 const CITY_CACHE_KEY = 'sacramento-city-repair-cache'
 const CITY_CACHE_TTL_MS = 30 * 60 * 1000
 const LOCAL_STORAGE_KEY = 'sacramento-infrastructure-reports'
+const LOCAL_CONFIRMATIONS_KEY = 'sacramento-infrastructure-confirmations'
+const CONFIRMER_ID_KEY = 'sacramento-infrastructure-confirmer-id'
+const CONFIRMATION_THRESHOLD = 3
 const NEARBY_RADIUS_KM = 5
 const NEAR_DUPLICATE_RADIUS_KM = 1
 const LAST_90_DAYS_MS = 90 * 24 * 60 * 60 * 1000
@@ -456,6 +460,23 @@ async function submitReportToApi(report: Report) {
   }
 }
 
+function getOrCreateConfirmerId() {
+  const storedId = localStorage.getItem(CONFIRMER_ID_KEY)
+  if (storedId) return storedId
+
+  const confirmerId = crypto.randomUUID()
+  localStorage.setItem(CONFIRMER_ID_KEY, confirmerId)
+  return confirmerId
+}
+
+function readConfirmedReportIds() {
+  const savedIds: unknown = JSON.parse(localStorage.getItem(LOCAL_CONFIRMATIONS_KEY) || '[]')
+  if (!Array.isArray(savedIds) || !savedIds.every((id) => typeof id === 'string')) {
+    throw new Error('Saved confirmations have an unexpected format.')
+  }
+  return savedIds.filter((id): id is string => typeof id === 'string')
+}
+
 function MapClickHandler({ enabled, onSelect }: { enabled: boolean; onSelect: (latitude: number, longitude: number) => void }) {
   useMapEvents({
     click(event) {
@@ -465,18 +486,105 @@ function MapClickHandler({ enabled, onSelect }: { enabled: boolean; onSelect: (l
   return null
 }
 
-function RecenterButton() {
+function MapSizeInvalidator() {
   const map = useMap()
+
+  useEffect(() => {
+    let frame = 0
+    const invalidateSize = () => {
+      cancelAnimationFrame(frame)
+      frame = requestAnimationFrame(() => map.invalidateSize({ pan: false }))
+    }
+
+    invalidateSize()
+    const container = map.getContainer()
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(invalidateSize)
+    observer?.observe(container)
+    window.addEventListener('resize', invalidateSize)
+
+    return () => {
+      cancelAnimationFrame(frame)
+      observer?.disconnect()
+      window.removeEventListener('resize', invalidateSize)
+    }
+  }, [map])
+
+  return null
+}
+
+function MapControls({
+  location,
+  onLocationFound,
+  onLocationError,
+}: {
+  location: Coordinates | null
+  onLocationFound: (location: Coordinates) => void
+  onLocationError: (message: string) => void
+}) {
+  const map = useMap()
+  const [zoom, setZoom] = useState(map.getZoom())
+  const [isLocating, setIsLocating] = useState(false)
+
+  useEffect(() => {
+    const updateZoom = () => setZoom(map.getZoom())
+    map.on('zoomend', updateZoom)
+    return () => {
+      map.off('zoomend', updateZoom)
+    }
+  }, [map])
+
+  async function recenterOnMyLocation() {
+    onLocationError('')
+    if (location) {
+      map.setView([location.latitude, location.longitude], 15, { animate: false })
+      return
+    }
+
+    setIsLocating(true)
+    try {
+      const currentLocation = await getCurrentPosition()
+      onLocationFound(currentLocation)
+      map.setView([currentLocation.latitude, currentLocation.longitude], 15, { animate: false })
+    } catch (error) {
+      onLocationError(error instanceof Error ? error.message : 'Unable to get your location.')
+    } finally {
+      setIsLocating(false)
+    }
+  }
+
   return (
-    <button
-      className="map-control"
-      type="button"
-      aria-label="Recenter map on Sacramento"
-      title="Recenter map"
-      onClick={() => map.setView([38.5816, -121.4944], 13, { animate: false })}
-    >
-      <Crosshair size={17} />
-    </button>
+    <div className="map-controls">
+      <button
+        className="map-control"
+        type="button"
+        aria-label="Recenter map on my location"
+        title="Recenter map on my location"
+        onClick={() => void recenterOnMyLocation()}
+        disabled={isLocating}
+      >
+        {isLocating ? <span className="button-spinner" /> : <Crosshair size={17} />}
+      </button>
+      <button
+        className="map-control map-zoom-control"
+        type="button"
+        aria-label="Zoom in"
+        title="Zoom in"
+        onClick={() => map.zoomIn()}
+        disabled={zoom >= map.getMaxZoom()}
+      >
+        +
+      </button>
+      <button
+        className="map-control map-zoom-control"
+        type="button"
+        aria-label="Zoom out"
+        title="Zoom out"
+        onClick={() => map.zoomOut()}
+        disabled={zoom <= map.getMinZoom()}
+      >
+        -
+      </button>
+    </div>
   )
 }
 
@@ -531,8 +639,22 @@ function NearbyMapController({
   return null
 }
 
-function ReportMarker({ report }: { report: Report }) {
+function ReportMarker({
+  report,
+  hasConfirmed,
+  isConfirming,
+  confirmationError,
+  onConfirm,
+}: {
+  report: Report
+  hasConfirmed: boolean
+  isConfirming: boolean
+  confirmationError?: string
+  onConfirm: () => void
+}) {
   const color = issueColors[report.issue_type]
+  const confirmationCount = report.confirmation_count ?? 0
+  const isConfirmed = confirmationCount >= CONFIRMATION_THRESHOLD
   const locationText = reportLocationLabel(report)
   const reportDate = new Date(report.created_at).toLocaleDateString()
   const reportTime = new Date(report.created_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
@@ -551,6 +673,17 @@ function ReportMarker({ report }: { report: Report }) {
             <span className={`popup-status ${report.status}`}>{statusLabel(report.status)}</span>
           </div>
           {report.status !== 'resolved' && <span className="popup-age">{reportAgeLabel(report)}</span>}
+          {report.source === 'user' && (
+            <div className={`report-confirmation ${isConfirmed ? 'confirmed' : 'unconfirmed'}`}>
+              <span>{isConfirmed ? `Confirmed by ${confirmationCount} people` : `Unconfirmed · ${confirmationCount}/${CONFIRMATION_THRESHOLD} confirmations`}</span>
+              {report.status !== 'resolved' && (
+                <button type="button" onClick={onConfirm} disabled={hasConfirmed || isConfirming}>
+                  {isConfirming ? 'Confirming…' : hasConfirmed ? 'You confirmed this report' : 'Confirm this report'}
+                </button>
+              )}
+              {confirmationError && <span className="confirmation-error" role="alert">{confirmationError}</span>}
+            </div>
+          )}
           <p>{report.description}</p>
           <div className="popup-meta">
             <span>Found at {locationText}</span>
@@ -591,6 +724,11 @@ function UserLocationMarker({ location, label }: { location: Coordinates; label:
 function App() {
   const [cityReports, setCityReports] = useState<Report[]>([])
   const [userReports, setUserReports] = useState<Report[]>([])
+  const [confirmerId, setConfirmerId] = useState('')
+  const [confirmedReportIds, setConfirmedReportIds] = useState<Set<string>>(new Set())
+  const [confirmingReportIds, setConfirmingReportIds] = useState<Set<string>>(new Set())
+  const [confirmationErrors, setConfirmationErrors] = useState<Record<string, string>>({})
+  const [confirmationSetupError, setConfirmationSetupError] = useState('')
   const [cityLoading, setCityLoading] = useState(true)
   const [reportsLoading, setReportsLoading] = useState(true)
   const [cityError, setCityError] = useState('')
@@ -602,6 +740,7 @@ function App() {
   const [dateFilter, setDateFilter] = useState<DateFilter>('last-90-days')
   const [customStartDate, setCustomStartDate] = useState('')
   const [customEndDate, setCustomEndDate] = useState('')
+  const [deviceLocation, setDeviceLocation] = useState<Coordinates | null>(null)
   const [nearMeLocation, setNearMeLocation] = useState<Coordinates | null>(null)
   const [isNearMeActive, setIsNearMeActive] = useState(false)
   const [isLocating, setIsLocating] = useState(false)
@@ -625,6 +764,15 @@ function App() {
   const [selectedMyReportId, setSelectedMyReportId] = useState<string | null>(null)
   const reportPanelRef = useRef<HTMLDivElement | null>(null)
   const reportDragOffset = useRef<{ x: number; y: number } | null>(null)
+
+  useEffect(() => {
+    try {
+      setConfirmerId(getOrCreateConfirmerId())
+      setConfirmedReportIds(new Set(readConfirmedReportIds()))
+    } catch (error) {
+      setConfirmationSetupError(error instanceof Error ? error.message : 'Unable to load saved confirmations.')
+    }
+  }, [])
 
   useEffect(() => {
     if (!isPlacing) return
@@ -668,6 +816,7 @@ function App() {
     void getCurrentPosition()
       .then((location) => {
         if (active) {
+          setDeviceLocation(location)
           setNearMeLocation(location)
           setIsNearMeActive(true)
         }
@@ -722,7 +871,7 @@ function App() {
         if (supabase) {
           const { data, error } = await supabase
             .from('reports')
-            .select('id, issue_type, description, severity, latitude, longitude, status, source, created_at, external_id')
+            .select('id, issue_type, description, severity, latitude, longitude, status, source, created_at, external_id, confirmation_count')
             .eq('source', 'user')
             .order('created_at', { ascending: false })
             .limit(1000)
@@ -739,12 +888,16 @@ function App() {
               source: 'user',
               created_at: row.created_at,
               external_id: row.external_id,
+              confirmation_count: row.confirmation_count ?? 0,
             })))
           }
         } else {
           const savedReports: unknown = JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEY) || '[]')
           if (!isReportArray(savedReports)) throw new Error('Saved reports have an unexpected format. Clear the browser storage and try again.')
-          if (active) setUserReports(savedReports)
+          if (active) setUserReports(savedReports.map((report) => ({
+            ...report,
+            confirmation_count: report.confirmation_count ?? 0,
+          })))
         }
       } catch (error) {
         if (active) setReportsError(error instanceof Error ? error.message : 'Unable to load saved reports.')
@@ -792,6 +945,62 @@ function App() {
   const openCount = summaryReports.filter((report) => report.status !== 'resolved').length
   const resolvedCount = summaryReports.length - openCount
   const isLoading = cityLoading || reportsLoading
+
+  async function confirmReport(report: Report) {
+    if (report.source !== 'user') return
+    if (!confirmerId) {
+      setConfirmationErrors((current) => ({
+        ...current,
+        [report.id]: confirmationSetupError || 'Confirmation is unavailable because browser storage could not be accessed.',
+      }))
+      return
+    }
+    if (confirmedReportIds.has(report.id) || confirmingReportIds.has(report.id)) return
+
+    setConfirmingReportIds((current) => new Set(current).add(report.id))
+    setConfirmationErrors((current) => {
+      const next = { ...current }
+      delete next[report.id]
+      return next
+    })
+
+    try {
+      if (supabase) {
+        const { error } = await supabase
+          .from('report_confirmations')
+          .insert({ report_id: report.id, confirmer_id: confirmerId })
+        if (error && error.code !== '23505') {
+          throw new Error(`Could not confirm this report: ${error.message}`)
+        }
+        if (!error) {
+          setUserReports((current) => current.map((item) => item.id === report.id
+            ? { ...item, confirmation_count: (item.confirmation_count ?? 0) + 1 }
+            : item))
+        }
+      } else {
+        const nextReports = userReports.map((item) => item.id === report.id
+          ? { ...item, confirmation_count: (item.confirmation_count ?? 0) + 1 }
+          : item)
+        localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(nextReports))
+        setUserReports(nextReports)
+      }
+
+      const nextConfirmedIds = new Set(confirmedReportIds).add(report.id)
+      localStorage.setItem(LOCAL_CONFIRMATIONS_KEY, JSON.stringify([...nextConfirmedIds]))
+      setConfirmedReportIds(nextConfirmedIds)
+    } catch (error) {
+      setConfirmationErrors((current) => ({
+        ...current,
+        [report.id]: error instanceof Error ? error.message : 'Unable to confirm this report.',
+      }))
+    } finally {
+      setConfirmingReportIds((current) => {
+        const next = new Set(current)
+        next.delete(report.id)
+        return next
+      })
+    }
+  }
 
   function toggleStatusFilter(nextFilter: StatusFilter) {
     setStatusFilter((current) => current === nextFilter ? 'all' : nextFilter)
@@ -904,6 +1113,7 @@ function App() {
     void getCurrentPosition()
       .then(async (location) => {
         const locationLabel = await getLocationAddressLabel(location)
+        setDeviceLocation(location)
         setIssueType('pothole')
         setDraftLocation(location)
         setAddressQuery(locationLabel)
@@ -937,11 +1147,30 @@ function App() {
     setNearMeError('')
     try {
       const location = await getCurrentPosition()
+      setDeviceLocation(location)
       setNearMeLocation(location)
       setIsNearMeActive(true)
       if (!addressQuery.trim()) {
         setAddressQuery('Your location')
       }
+    } catch (error) {
+      setNearMeError(error instanceof Error ? error.message : 'Unable to get your location.')
+    } finally {
+      setIsLocating(false)
+    }
+  }
+
+  async function getMyLocationForAddress() {
+    setIsLocating(true)
+    setNearMeError('')
+    setAddressError('')
+    try {
+      const location = await getCurrentPosition()
+      const locationLabel = await getLocationAddressLabel(location)
+      setDeviceLocation(location)
+      setNearMeLocation(location)
+      setIsNearMeActive(true)
+      setAddressQuery(locationLabel)
     } catch (error) {
       setNearMeError(error instanceof Error ? error.message : 'Unable to get your location.')
     } finally {
@@ -1002,6 +1231,7 @@ function App() {
       source: 'user',
       created_at: new Date().toISOString(),
       address: formatReportLocation(draftLocation, addressQuery.trim() || null),
+      confirmation_count: 0,
     }
 
     if (!skipDuplicateCheck) {
@@ -1040,7 +1270,7 @@ function App() {
             source: report.source,
             created_at: report.created_at,
           })
-          .select('id, issue_type, description, severity, latitude, longitude, status, source, created_at, external_id')
+          .select('id, issue_type, description, severity, latitude, longitude, status, source, created_at, external_id, confirmation_count')
           .single()
         if (error) throw new Error(`Could not save your report: ${error.message}`)
         savedReport = {
@@ -1048,6 +1278,7 @@ function App() {
           id: data.id,
           created_at: data.created_at,
           external_id: data.external_id,
+          confirmation_count: data.confirmation_count ?? 0,
         }
         setUserReports((current) => [savedReport, ...current])
       } else {
@@ -1079,6 +1310,9 @@ function App() {
   }
 
   function dismissDuplicateReport() {
+    if (duplicateReport?.source === 'user') {
+      void confirmReport(duplicateReport)
+    }
     cancelPlacing()
   }
 
@@ -1091,7 +1325,9 @@ function App() {
         <p>Something similar was recently reported in this area, is this the same?</p>
         <span>{issueLabel(duplicateReport.issue_type)} · {distance < 1 ? `${Math.round(distance * 1000)} m` : `${distance.toFixed(1)} km`} away · {new Date(duplicateReport.created_at).toLocaleDateString()}</span>
         <div className="duplicate-actions">
-          <button type="button" onClick={dismissDuplicateReport}>Yes, don't submit another</button>
+          <button type="button" onClick={dismissDuplicateReport}>
+            {duplicateReport.source === 'user' ? 'Yes, confirm this report' : "Yes, don't submit another"}
+          </button>
           <button type="button" onClick={submitAsNewReport} disabled={isSaving}>No, submit a new report</button>
         </div>
       </div>
@@ -1102,14 +1338,10 @@ function App() {
     <div className="app-shell">
       <header className="topbar">
         <a className="brand" href="/" aria-label="StreetScope home">
-          <span className="brand-mark"><Activity size={19} strokeWidth={2.2} /></span>
           <span className="brand-name">Street<span>Scope</span></span>
           <span className="brand-divider" />
           <span className="brand-place">SACRAMENTO, CA</span>
         </a>
-        <div className="topbar-right">
-          <span className="live-indicator"><span /> PUBLIC DATA</span>
-        </div>
       </header>
 
       <main className="workspace">
@@ -1119,26 +1351,33 @@ function App() {
               <span className="stat-label">ON THE MAP</span>
               <strong>{isLoading ? '—' : summaryReports.length.toLocaleString()}</strong>
               <span className="stat-caption">total reports</span>
-              <span className="stat-icon"><MapPin size={15} /></span>
             </button>
             <button type="button" className={`stat-card ${statusFilter === 'needs-attention' ? 'active' : ''}`} onClick={() => toggleStatusFilter('needs-attention')}>
               <span className="stat-label">NEEDS ATTENTION</span>
               <strong>{isLoading ? '—' : openCount.toLocaleString()}</strong>
               <span className="stat-caption">open issues</span>
-              <span className="stat-icon attention"><ArrowUpRight size={15} /></span>
             </button>
             <button type="button" className={`stat-card ${statusFilter === 'resolved' ? 'active' : ''}`} onClick={() => toggleStatusFilter('resolved')}>
               <span className="stat-label">TAKEN CARE OF</span>
               <strong>{isLoading ? '—' : resolvedCount.toLocaleString()}</strong>
               <span className="stat-caption">resolved</span>
-              <span className="stat-icon resolved"><Check size={15} /></span>
             </button>
           </section>
 
           <section className="address-search-section">
             <div className="section-title-row">
               <h2><MapPin size={15} /> ADDRESS</h2>
+              <button
+                className="near-me-button address-location-button"
+                type="button"
+                onClick={() => void getMyLocationForAddress()}
+                disabled={isLocating}
+              >
+                {isLocating ? <span className="button-spinner" /> : <LocateFixed size={14} />}
+                {isLocating ? 'Finding your location…' : 'Get my location'}
+              </button>
             </div>
+            {nearMeError && <p className="inline-error near-me-error" role="alert"><AlertCircle size={14} /> {nearMeError}</p>}
             <form className="address-search-form" onSubmit={(event) => void searchAddress(event)}>
               <input
                 type="text"
@@ -1157,7 +1396,6 @@ function App() {
           <section className="filter-section">
             <div className="section-title-row">
               <h2><Filter size={15} /> FILTER THE MAP</h2>
-              <span className="result-count">{filteredReports.length} SHOWN</span>
             </div>
             <button
               className={`near-me-button ${isNearMeActive ? 'active' : ''}`}
@@ -1169,7 +1407,6 @@ function App() {
               {isLocating ? 'Finding your location…' : isNearMeActive ? 'Showing problems near me' : 'Problems near me'}
               {isNearMeActive && <span className="near-me-radius">5 KM · ON</span>}
             </button>
-            {nearMeError && <p className="inline-error near-me-error" role="alert"><AlertCircle size={14} /> {nearMeError}</p>}
             {isNearMeActive && (
               <p className="near-me-summary">
                 {filteredReports.length
@@ -1343,7 +1580,7 @@ function App() {
             center={[38.5816, -121.4944]}
             zoom={13}
             minZoom={10}
-            maxZoom={19}
+            maxZoom={18}
             preferCanvas
             scrollWheelZoom
             className={isPlacing ? 'leaflet-map placing' : 'leaflet-map'}
@@ -1356,6 +1593,7 @@ function App() {
                 : 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png'}
               subdomains={cartoBasemapKey ? 'abcd' : 'abc'}
             />
+            <MapSizeInvalidator />
             <MapClickHandler enabled={isPlacing} onSelect={async (latitude, longitude) => {
               const location = { latitude, longitude }
               setDraftLocation(location)
@@ -1365,7 +1603,15 @@ function App() {
               setReportPanelOpen(true)
               setIsPlacing(false)
             }} />
-            <RecenterButton />
+            <MapControls
+              location={deviceLocation}
+              onLocationFound={(location) => {
+                setDeviceLocation(location)
+                setNearMeLocation(location)
+                setAddressQuery('Your location')
+              }}
+              onLocationError={setNearMeError}
+            />
             <MyReportsMapController report={selectedMyReport} />
             <NearbyMapController active={isNearMeActive} location={nearMeLocation} reports={filteredReports} />
             {nearMeLocation && (
@@ -1378,7 +1624,16 @@ function App() {
                 <UserLocationMarker location={nearMeLocation} label={addressQuery || 'Your location'} />
               </>
             )}
-            {filteredReports.map((report) => <ReportMarker key={report.id} report={report} />)}
+            {filteredReports.map((report) => (
+              <ReportMarker
+                key={report.id}
+                report={report}
+                hasConfirmed={confirmedReportIds.has(report.id)}
+                isConfirming={confirmingReportIds.has(report.id)}
+                confirmationError={confirmationErrors[report.id] || confirmationSetupError}
+                onConfirm={() => void confirmReport(report)}
+              />
+            ))}
             {draftLocation && (
               <CircleMarker
                 center={[draftLocation.latitude, draftLocation.longitude]}
@@ -1427,6 +1682,11 @@ function App() {
                           </span>
                           <span className="my-report-item-description">{report.description}</span>
                           <span className="my-report-item-date">{new Date(report.created_at).toLocaleDateString()}</span>
+                          <span className={`my-report-confirmation ${(report.confirmation_count ?? 0) >= CONFIRMATION_THRESHOLD ? 'confirmed' : 'unconfirmed'}`}>
+                            {(report.confirmation_count ?? 0) >= CONFIRMATION_THRESHOLD
+                              ? `Confirmed by ${report.confirmation_count} people`
+                              : 'Unconfirmed'}
+                          </span>
                         </button>
                         {!supabase && (
                           reportPendingDeletion === report.id ? (
