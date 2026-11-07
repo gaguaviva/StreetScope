@@ -3,7 +3,8 @@ import type { CSSProperties, FormEvent, PointerEvent as ReactPointerEvent } from
 import { MapContainer, TileLayer, CircleMarker, Marker, Popup, useMap, useMapEvents } from 'react-leaflet'
 import { divIcon, latLngBounds } from 'leaflet'
 import { createClient } from '@supabase/supabase-js'
-import { Activity, AlertCircle, ArrowDown, ArrowUpRight, Check, ChevronDown, CircleDot, Crosshair, Filter, LocateFixed, MapPin, Plus, Radio, X } from 'lucide-react'
+import { Activity, AlertCircle, ArrowDown, ArrowUpRight, Check, ChevronDown, Crosshair, Filter, LocateFixed, MapPin, Plus, Radio, Search, X } from 'lucide-react'
+import { appConfig } from './config'
 
 type IssueType =
   | 'pothole'
@@ -588,7 +589,7 @@ function App() {
   const [typeFilter, setTypeFilter] = useState<IssueType | 'all'>('all')
   const [visibleIssueTypes, setVisibleIssueTypes] = useState<IssueType[]>(issueTypes)
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
-  const [showMyReports, setShowMyReports] = useState(false)
+  const [, setShowMyReports] = useState(false)
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [dateFilter, setDateFilter] = useState<DateFilter>('last-90-days')
   const [customStartDate, setCustomStartDate] = useState('')
@@ -1182,19 +1183,6 @@ function App() {
                 )}
               </div>
             )}
-          </section>
-
-          <section className="legend-section">
-            <div className="section-title-row"><h2><CircleDot size={15} /> MAP KEY</h2></div>
-            <div className="legend-grid">
-              {issueTypes.map((type) => (
-                <div className="legend-item" key={type}>
-                  <span className="legend-dot" style={{ backgroundColor: issueColors[type] }} />
-                  <span>{issueLabel(type)}</span>
-                </div>
-              ))}
-            </div>
-            <div className="source-key"><span className="source-key-ring" /> Community report <span className="source-key-dot" /> City record</div>
           </section>
 
           {isPlacing && (
