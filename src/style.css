@@ -435,9 +435,34 @@ h1 span { color: #778d6e; }
 .leaflet-tile { filter: saturate(0.76); }
 .leaflet-popup-content-wrapper { border-radius: 7px; box-shadow: 0 8px 26px #252c271a; }
 .leaflet-popup-content { margin: 13px 15px; min-width: 205px; }
-.popup-topline { display: flex; align-items: center; gap: 7px; color: #30382e; font-size: 11px; }
-.popup-time { color: #7b8678; font-size: 9px; font-family: var(--mono); }
-.popup-dot { width: 8px; height: 8px; border-radius: 50%; }
+.popup-topline {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #30382e;
+  font-size: 11px;
+  line-height: 1.1;
+}
+.popup-topline strong {
+  white-space: nowrap;
+  line-height: 1.1;
+  font-weight: 700;
+}
+.popup-time {
+  margin-left: 1px;
+  color: #7b8678;
+  font-size: 11px;
+  font-family: inherit;
+  line-height: 1.1;
+  font-weight: 600;
+}
+.popup-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  align-self: center;
+}
 .popup-status { margin-left: auto; border-radius: 10px; padding: 3px 6px; color: #737b70; background: #f0f2ed; font-size: 8px; }
 .popup-status.open { color: #a4573c; background: #fbefe8; }
 .popup-status.resolved { color: #557a5f; background: #edf4eb; }
