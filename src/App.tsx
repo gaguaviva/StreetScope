@@ -1,16 +1,29 @@
-import { useEffect, useMemo, useState } from 'react'
-import type { CSSProperties, FormEvent } from 'react'
-import { MapContainer, TileLayer, CircleMarker, Popup, useMap, useMapEvents } from 'react-leaflet'
-import { latLngBounds } from 'leaflet'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { CSSProperties, FormEvent, PointerEvent as ReactPointerEvent } from 'react'
+import { MapContainer, TileLayer, CircleMarker, Marker, Popup, useMap, useMapEvents } from 'react-leaflet'
+import { divIcon, latLngBounds } from 'leaflet'
 import { createClient } from '@supabase/supabase-js'
-import { Activity, AlertCircle, ArrowDown, ArrowUpRight, Check, ChevronDown, CircleDot, ClipboardList, Crosshair, Filter, LocateFixed, MapPin, Plus, Radio, X } from 'lucide-react'
+import { Activity, AlertCircle, ArrowDown, ArrowUpRight, Check, ChevronDown, CircleDot, Crosshair, Filter, LocateFixed, MapPin, Plus, Radio, X } from 'lucide-react'
 
-type IssueType = 'pothole' | 'streetlight' | 'construction' | 'sidewalk'
+type IssueType =
+  | 'pothole'
+  | 'streetlight'
+  | 'construction'
+  | 'sidewalk'
+  | 'trash'
+  | 'drainage'
+  | 'water'
+  | 'sewer'
+  | 'animal'
+  | 'parking'
+  | 'park'
+  | 'homeless'
+  | 'other'
 type Severity = 'low' | 'medium' | 'high'
 type ReportStatus = 'open' | 'in-progress' | 'resolved'
 type ReportSource = 'user' | 'city-of-sacramento'
 type SourceFilter = 'all' | ReportSource
-type StatusFilter = 'all' | ReportStatus
+type StatusFilter = 'all' | ReportStatus | 'needs-attention'
 type DateFilter = 'all' | 'last-90-days' | 'custom'
 interface Coordinates {
   latitude: number
@@ -27,6 +40,7 @@ interface Report {
   status: ReportStatus
   source: ReportSource
   created_at: string
+  address?: string
   external_id?: string | null
 }
 
@@ -39,24 +53,50 @@ interface ArcGisFeatureCollection {
   error?: { message?: string }
 }
 
-const CITY_LAYER_URL = 'https://services5.arcgis.com/54falWtcpty3V47Z/arcgis/rest/services/311_Repairs_WFL1/FeatureServer'
+const CITY_LAYER_URL = appConfig.cityLayerUrl
+const LEGACY_CITY_LAYER_URL = appConfig.legacyCityLayerUrl
 const CITY_CACHE_KEY = 'sacramento-city-repair-cache'
 const CITY_CACHE_TTL_MS = 30 * 60 * 1000
 const LOCAL_STORAGE_KEY = 'sacramento-infrastructure-reports'
 const NEARBY_RADIUS_KM = 5
 const LAST_90_DAYS_MS = 90 * 24 * 60 * 60 * 1000
-const issueTypes: IssueType[] = ['pothole', 'streetlight', 'construction', 'sidewalk']
+const issueTypes: IssueType[] = [
+  'pothole',
+  'streetlight',
+  'construction',
+  'sidewalk',
+  'trash',
+  'drainage',
+  'water',
+  'sewer',
+  'animal',
+  'parking',
+  'park',
+  'homeless',
+  'other',
+]
 const issueColors: Record<IssueType, string> = {
   pothole: '#ef8257',
   streetlight: '#e5ad4e',
   construction: '#6187d9',
   sidewalk: '#4ca98b',
+  trash: '#6c8b4d',
+  drainage: '#62a6c4',
+  water: '#4b7ad6',
+  sewer: '#7d5db0',
+  animal: '#c46d6d',
+  parking: '#d0a24d',
+  park: '#3c8f67',
+  homeless: '#8d5d44',
+  other: '#7d8597',
 }
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
+const supabaseUrl = appConfig.supabaseUrl
+const supabaseAnonKey = appConfig.supabaseAnonKey
 const supabase = supabaseUrl && supabaseAnonKey ? createClient(supabaseUrl, supabaseAnonKey) : null
-const cartoBasemapKey = import.meta.env.VITE_CARTO_BASEMAP_KEY?.trim()
+const cartoBasemapKey = appConfig.cartoBasemapKey
+const reportApiUrl = appConfig.reportApiUrl
+const reportApiToken = appConfig.reportApiToken
 let locationRequest: Promise<Coordinates> | null = null
 let cityReportsRequest: Promise<Report[]> | null = null
 
@@ -77,14 +117,24 @@ function issueLabel(issueType: IssueType) {
     streetlight: 'Street light',
     construction: 'Construction',
     sidewalk: 'Sidewalk',
+    trash: 'Trash / solid waste',
+    drainage: 'Drainage',
+    water: 'Water',
+    sewer: 'Sewer',
+    animal: 'Animal control',
+    parking: 'Parking',
+    park: 'Parks / public space',
+    homeless: 'Homeless encampment',
+    other: 'Other',
   }[issueType]
 }
 
-function statusLabel(status: ReportStatus) {
+function statusLabel(status: ReportStatus | 'needs-attention') {
   return {
     open: 'Open',
     'in-progress': 'In-progress',
     resolved: 'Resolved',
+    'needs-attention': 'Needs attention',
   }[status]
 }
 
@@ -142,6 +192,21 @@ function customRangeError(startDate: string, endDate: string) {
   return ''
 }
 
+function formatReportLocation(location: Coordinates | null, locationLabel?: string | null) {
+  const cleanedLabel = locationLabel?.trim()
+  if (cleanedLabel) return cleanedLabel
+  if (!location) return 'your current location'
+  return `${location.latitude.toFixed(5)}, ${location.longitude.toFixed(5)}`
+}
+
+function buildAutoDescription(issueType: IssueType, location: Coordinates | null, locationLabel?: string | null) {
+  return `Found a ${issueLabel(issueType).toLowerCase()} at ${formatReportLocation(location, locationLabel)}`
+}
+
+function reportLocationLabel(report: Report) {
+  return `${report.latitude.toFixed(5)}, ${report.longitude.toFixed(5)}`
+}
+
 function isWithinCustomDateRange(report: Report, startDate: string, endDate: string) {
   const reportTime = Date.parse(report.created_at)
   if (!Number.isFinite(reportTime)) return false
@@ -172,7 +237,102 @@ function coordinatesFor(feature: NonNullable<ArcGisFeatureCollection['features']
   return { latitude: totals.latitude / validPoints.length, longitude: totals.longitude / validPoints.length }
 }
 
+async function getLocationAddressLabel(location: Coordinates): Promise<string> {
+  try {
+    const response = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(String(location.latitude))}&lon=${encodeURIComponent(String(location.longitude))}`,
+    )
+    if (!response.ok) throw new Error('Address lookup failed.')
+    const result = await response.json() as { display_name?: string }
+    const address = result.display_name?.trim()
+    if (address) return address
+  } catch (error) {
+    console.warn('Reverse geocoding failed.', error)
+  }
+
+  return `${location.latitude.toFixed(5)}, ${location.longitude.toFixed(5)}`
+}
+
+function normalizeCityIssueType(categoryName: string, categoryLevel1?: string): IssueType {
+  const combined = `${categoryName || ''} ${categoryLevel1 || ''}`.toLowerCase()
+
+  if (combined.includes('pothole')) return 'pothole'
+  if (combined.includes('street light') || combined.includes('street lighting') || combined.includes('streetlight')) return 'streetlight'
+  if (combined.includes('sidewalk') || combined.includes('curb')) return 'sidewalk'
+  if (combined.includes('construction') || combined.includes('roadwork') || combined.includes('road work')) return 'construction'
+  if (combined.includes('street') && (combined.includes('repair') || combined.includes('maintenance'))) return 'pothole'
+  if (combined.includes('drain') || combined.includes('stormwater') || combined.includes('ditch')) return 'drainage'
+  if (combined.includes('sewer') || combined.includes('sanitary')) return 'sewer'
+  if (combined.includes('water') || combined.includes('hydrant') || combined.includes('utility')) return 'water'
+  if (combined.includes('trash') || combined.includes('dumping') || combined.includes('solid waste') || combined.includes('litter') || combined.includes('garbage')) return 'trash'
+  if (combined.includes('animal') || combined.includes('pet')) return 'animal'
+  if (combined.includes('parking') || combined.includes('parked') || combined.includes('parking meter')) return 'parking'
+  if (combined.includes('park') || combined.includes('ranger') || combined.includes('playground') || combined.includes('tree')) return 'park'
+  if (combined.includes('homeless') || combined.includes('encampment')) return 'homeless'
+  if (combined.includes('street') || combined.includes('road') || combined.includes('sign') || combined.includes('traffic')) return 'construction'
+  if (combined.includes('facility') || combined.includes('building') || combined.includes('permit') || combined.includes('planning')) return 'other'
+
+  return 'other'
+}
+
+function normalizeCityStatus(status: string | null | undefined): ReportStatus {
+  const normalized = String(status || '').trim().toLowerCase()
+  if (normalized === 'closed') return 'resolved'
+  if (normalized === 'in progress' || normalized === 'in-progress') return 'in-progress'
+  return 'open'
+}
+
 async function fetchCityLayer(layer: number, signal: AbortSignal): Promise<Report[]> {
+  const query = new URLSearchParams({
+    where: '1=1',
+    outFields: 'OBJECTID,CategoryName,CategoryLevel1,CategoryLevel2,PublicStatus,DateCreated,DateUpdated,Address,CrossStreet,Neighborhood',
+    returnGeometry: 'true',
+    outSR: '4326',
+    geometryPrecision: '5',
+    resultRecordCount: '1000',
+    orderByFields: 'DateUpdated DESC',
+    f: 'geojson',
+  })
+  const response = await fetch(`${CITY_LAYER_URL}/${layer}/query?${query}`, { signal })
+  if (!response.ok) throw new Error(`City data request failed (${response.status}).`)
+
+  const collection = await response.json() as ArcGisFeatureCollection
+  if (collection.error) throw new Error(collection.error.message || 'The City of Sacramento data service returned an error.')
+
+  return (collection.features || []).flatMap((feature) => {
+    const position = coordinatesFor(feature)
+    if (!position) return []
+
+    const properties = feature.properties || {}
+    const categoryName = String(properties.CategoryName || '').trim()
+    const categoryLevel1 = typeof properties.CategoryLevel1 === 'string' ? properties.CategoryLevel1 : ''
+    const issueType = normalizeCityIssueType(categoryName, categoryLevel1)
+
+    const dateCreated = Number(properties.DateCreated)
+    const date = Number.isFinite(dateCreated) && dateCreated > 0 ? new Date(dateCreated) : new Date()
+    const address = typeof properties.Address === 'string' ? properties.Address.trim() : ''
+    const crossStreet = typeof properties.CrossStreet === 'string' ? properties.CrossStreet.trim() : ''
+    const neighborhood = typeof properties.Neighborhood === 'string' ? properties.Neighborhood.trim() : ''
+    const location = [address, crossStreet, neighborhood].filter(Boolean).join(' · ')
+    const status = normalizeCityStatus(typeof properties.PublicStatus === 'string' ? properties.PublicStatus : null)
+
+    return [{
+      id: `city-${layer}-${String(properties.OBJECTID ?? feature.id ?? crypto.randomUUID())}`,
+      external_id: String(properties.OBJECTID ?? feature.id ?? ''),
+      issue_type: issueType,
+      severity: 'medium' as const,
+      description: `${categoryName || issueLabel(issueType)} reported by the City${location ? ` at ${location}` : ''}.`,
+      latitude: position.latitude,
+      longitude: position.longitude,
+      status,
+      source: 'city-of-sacramento' as const,
+      created_at: date.toISOString(),
+      address: location || undefined,
+    }]
+  })
+}
+
+async function fetchLegacyCityLayer(layer: number, signal: AbortSignal): Promise<Report[]> {
   const query = new URLSearchParams({
     where: '1=1',
     outFields: 'OBJECTID,CategoryName,DateCreated,CrossStreet,Neighborhood',
@@ -183,11 +343,11 @@ async function fetchCityLayer(layer: number, signal: AbortSignal): Promise<Repor
     orderByFields: 'DateUpdated DESC',
     f: 'geojson',
   })
-  const response = await fetch(`${CITY_LAYER_URL}/${layer}/query?${query}`, { signal })
-  if (!response.ok) throw new Error(`City data request failed (${response.status}).`)
+  const response = await fetch(`${LEGACY_CITY_LAYER_URL}/${layer}/query?${query}`, { signal })
+  if (!response.ok) throw new Error(`Legacy city data request failed (${response.status}).`)
 
   const collection = await response.json() as ArcGisFeatureCollection
-  if (collection.error) throw new Error(collection.error.message || 'The City of Sacramento data service returned an error.')
+  if (collection.error) throw new Error(collection.error.message || 'The legacy Sacramento city data service returned an error.')
 
   return (collection.features || []).flatMap((feature) => {
     const position = coordinatesFor(feature)
@@ -203,7 +363,7 @@ async function fetchCityLayer(layer: number, signal: AbortSignal): Promise<Repor
     const location = [crossStreet, neighborhood].filter(Boolean).join(' · ')
 
     return [{
-      id: `city-${layer}-${String(properties.OBJECTID ?? feature.id ?? crypto.randomUUID())}`,
+      id: `legacy-city-${layer}-${String(properties.OBJECTID ?? feature.id ?? crypto.randomUUID())}`,
       external_id: String(properties.OBJECTID ?? feature.id ?? ''),
       issue_type: issueType,
       severity: 'medium' as const,
@@ -213,16 +373,18 @@ async function fetchCityLayer(layer: number, signal: AbortSignal): Promise<Repor
       status: 'resolved' as const,
       source: 'city-of-sacramento' as const,
       created_at: date.toISOString(),
+      address: location || undefined,
     }]
   })
 }
 
 async function fetchCityReports(signal: AbortSignal) {
-  const [streetLights, potholes] = await Promise.all([
+  const [current311, legacyStreetLights, legacyPotholes] = await Promise.all([
     fetchCityLayer(0, signal),
-    fetchCityLayer(1, signal),
+    fetchLegacyCityLayer(0, signal),
+    fetchLegacyCityLayer(1, signal),
   ])
-  return [...potholes, ...streetLights]
+  return [...legacyPotholes, ...legacyStreetLights, ...current311]
 }
 
 function getCachedCityReports() {
@@ -269,6 +431,29 @@ function loadCityReports() {
   return cityReportsRequest
 }
 
+async function submitReportToApi(report: Report) {
+  if (!reportApiUrl) return
+
+  const response = await fetch(reportApiUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-API-Key': reportApiToken,
+      Authorization: `Bearer ${reportApiToken}`,
+    },
+    body: JSON.stringify({
+      source: 'street-scope',
+      report,
+      submitted_at: new Date().toISOString(),
+      api_key: reportApiToken,
+    }),
+  })
+
+  if (!response.ok) {
+    throw new Error(`Report API request failed (${response.status}).`)
+  }
+}
+
 function MapClickHandler({ enabled, onSelect }: { enabled: boolean; onSelect: (latitude: number, longitude: number) => void }) {
   useMapEvents({
     click(event) {
@@ -291,6 +476,21 @@ function RecenterButton() {
       <Crosshair size={17} />
     </button>
   )
+}
+
+function MyReportsMapController({
+  report,
+}: {
+  report: Report | null
+}) {
+  const map = useMap()
+
+  useEffect(() => {
+    if (!report) return
+    map.flyTo([report.latitude, report.longitude], 15, { duration: 0.8 })
+  }, [map, report])
+
+  return null
 }
 
 function NearbyMapController({
@@ -323,6 +523,9 @@ function NearbyMapController({
 
 function ReportMarker({ report }: { report: Report }) {
   const color = issueColors[report.issue_type]
+  const locationText = reportLocationLabel(report)
+  const reportDate = new Date(report.created_at).toLocaleDateString()
+  const reportTime = new Date(report.created_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
   return (
     <CircleMarker
       center={[report.latitude, report.longitude]}
@@ -334,17 +537,44 @@ function ReportMarker({ report }: { report: Report }) {
           <div className="popup-topline">
             <span className="popup-dot" style={{ backgroundColor: color }} />
             <strong>{issueLabel(report.issue_type)}</strong>
+            <span className="popup-time">{reportTime}</span>
             <span className={`popup-status ${report.status}`}>{statusLabel(report.status)}</span>
           </div>
           {report.status !== 'resolved' && <span className="popup-age">{reportAgeLabel(report)}</span>}
           <p>{report.description}</p>
           <div className="popup-meta">
-            <span>{sourceLabel(report.source)}</span>
-            <span>{new Date(report.created_at).toLocaleDateString()}</span>
+            <span>Found at {locationText}</span>
+            <div className="popup-meta-row">
+              <span className="popup-meta-source">{sourceLabel(report.source)}</span>
+              <span className="popup-meta-date">{reportDate}</span>
+            </div>
           </div>
         </div>
       </Popup>
     </CircleMarker>
+  )
+}
+
+function UserLocationMarker({ location, label }: { location: Coordinates; label: string }) {
+  const userIcon = divIcon({
+    className: 'user-location-marker',
+    html: '<span class="user-location-marker-core"></span>',
+    iconSize: [18, 18],
+    iconAnchor: [9, 9],
+    popupAnchor: [0, -12],
+  })
+
+  return (
+    <Marker position={[location.latitude, location.longitude]} icon={userIcon}>
+      <Popup>
+        <div className="popup-content">
+          <div className="popup-topline">
+            <span className="popup-dot" style={{ backgroundColor: '#567052' }} />
+            <strong>{label || 'Your location'}</strong>
+          </div>
+        </div>
+      </Popup>
+    </Marker>
   )
 }
 
@@ -360,13 +590,16 @@ function App() {
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
   const [showMyReports, setShowMyReports] = useState(false)
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
-  const [dateFilter, setDateFilter] = useState<DateFilter>('all')
+  const [dateFilter, setDateFilter] = useState<DateFilter>('last-90-days')
   const [customStartDate, setCustomStartDate] = useState('')
   const [customEndDate, setCustomEndDate] = useState('')
   const [nearMeLocation, setNearMeLocation] = useState<Coordinates | null>(null)
   const [isNearMeActive, setIsNearMeActive] = useState(false)
   const [isLocating, setIsLocating] = useState(false)
   const [nearMeError, setNearMeError] = useState('')
+  const [addressQuery, setAddressQuery] = useState('')
+  const [isGeocoding, setIsGeocoding] = useState(false)
+  const [addressError, setAddressError] = useState('')
   const [isPlacing, setIsPlacing] = useState(false)
   const [draftLocation, setDraftLocation] = useState<{ latitude: number; longitude: number } | null>(null)
   const [description, setDescription] = useState('')
@@ -374,6 +607,46 @@ function App() {
   const [severity, setSeverity] = useState<Severity>('medium')
   const [isSaving, setIsSaving] = useState(false)
   const [formError, setFormError] = useState('')
+  const [reportPanelOpen, setReportPanelOpen] = useState(false)
+  const [reportPanelPosition, setReportPanelPosition] = useState({ x: 18, y: 78 })
+  const [myReportsOpen, setMyReportsOpen] = useState(false)
+  const [selectedMyReportId, setSelectedMyReportId] = useState<string | null>(null)
+  const reportPanelRef = useRef<HTMLDivElement | null>(null)
+  const reportDragOffset = useRef<{ x: number; y: number } | null>(null)
+
+  useEffect(() => {
+    if (!isPlacing) return
+
+    const handlePointerMove = (event: PointerEvent) => {
+      if (!reportDragOffset.current || !reportPanelRef.current) return
+      const container = reportPanelRef.current.parentElement
+      if (!container) return
+
+      const bounds = container.getBoundingClientRect()
+      const nextX = Math.min(
+        Math.max(event.clientX - bounds.left - reportDragOffset.current.x, 12),
+        Math.max(bounds.width - reportPanelRef.current.offsetWidth - 12, 12),
+      )
+      const nextY = Math.min(
+        Math.max(event.clientY - bounds.top - reportDragOffset.current.y, 12),
+        Math.max(bounds.height - reportPanelRef.current.offsetHeight - 12, 12),
+      )
+
+      setReportPanelPosition({ x: nextX, y: nextY })
+    }
+
+    const handlePointerUp = () => {
+      reportDragOffset.current = null
+    }
+
+    window.addEventListener('pointermove', handlePointerMove)
+    window.addEventListener('pointerup', handlePointerUp)
+
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove)
+      window.removeEventListener('pointerup', handlePointerUp)
+    }
+  }, [isPlacing])
 
   useEffect(() => {
     let active = true
@@ -396,6 +669,15 @@ function App() {
 
     return () => { active = false }
   }, [])
+
+  useEffect(() => {
+    if (!draftLocation) return
+    setDescription((current) => {
+      const trimmed = current.trim()
+      if (trimmed && !current.startsWith('Found a ')) return current
+      return buildAutoDescription(issueType, draftLocation, addressQuery.trim() || null)
+    })
+  }, [draftLocation, issueType, addressQuery])
 
   useEffect(() => {
     const cachedReports = getCachedCityReports()
@@ -467,10 +749,10 @@ function App() {
     ? customRangeError(customStartDate, customEndDate)
     : ''
   const reports = useMemo(() => [...userReports, ...cityReports], [userReports, cityReports])
-  const filteredReports = useMemo(() => reports.filter((report) =>
+  const summaryReports = useMemo(() => reports.filter((report) =>
     (typeFilter === 'all' || report.issue_type === typeFilter) &&
     visibleIssueTypes.includes(report.issue_type) &&
-    (showMyReports ? report.source === 'user' : sourceFilter === 'all' || report.source === sourceFilter) &&
+    (sourceFilter === 'all' || report.source === sourceFilter) &&
     (statusFilter === 'all' || report.status === statusFilter) &&
     (dateFilter === 'all' ||
       (dateFilter === 'last-90-days' && Date.parse(report.created_at) >= Date.now() - LAST_90_DAYS_MS) ||
@@ -479,29 +761,124 @@ function App() {
         (!selectedCustomRangeError && isWithinCustomDateRange(report, customStartDate, customEndDate))
       ))) &&
     (!isNearMeActive || !nearMeLocation || distanceInKilometers(nearMeLocation, report) <= NEARBY_RADIUS_KM),
-  ), [reports, typeFilter, visibleIssueTypes, sourceFilter, showMyReports, statusFilter, dateFilter, customStartDate, customEndDate, selectedCustomRangeError, isNearMeActive, nearMeLocation])
+  ), [reports, typeFilter, visibleIssueTypes, sourceFilter, statusFilter, dateFilter, customStartDate, customEndDate, selectedCustomRangeError, isNearMeActive, nearMeLocation])
 
-  const openCount = reports.filter((report) => report.status !== 'resolved').length
-  const resolvedCount = reports.length - openCount
+  const filteredReports = useMemo(() => summaryReports.filter((report) =>
+    statusFilter === 'all' ||
+    (statusFilter === 'needs-attention' ? report.status !== 'resolved' : report.status === statusFilter),
+  ), [summaryReports, statusFilter])
+
+  const myReports = useMemo(
+    () => userReports.filter((report) => report.source === 'user').slice(0, 20),
+    [userReports],
+  )
+
+  const selectedMyReport = useMemo(
+    () => myReports.find((report) => report.id === selectedMyReportId) ?? null,
+    [myReports, selectedMyReportId],
+  )
+
+  const openCount = summaryReports.filter((report) => report.status !== 'resolved').length
+  const resolvedCount = summaryReports.length - openCount
   const isLoading = cityLoading || reportsLoading
 
+  function toggleStatusFilter(nextFilter: StatusFilter) {
+    setStatusFilter((current) => current === nextFilter ? 'all' : nextFilter)
+  }
+
+  async function searchAddress(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const query = addressQuery.trim()
+    if (!query) {
+      setAddressError('Enter an address or place name.')
+      return
+    }
+
+    setIsGeocoding(true)
+    setAddressError('')
+
+    try {
+      const response = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(query)}`)
+      if (!response.ok) throw new Error('Address lookup failed.')
+      const results = await response.json() as Array<{ lat?: string; lon?: string; display_name?: string }>
+      const match = results[0]
+      if (!match || !match.lat || !match.lon) {
+        setAddressError('No matching address found on the map.')
+        return
+      }
+
+      const coordinates = { latitude: Number(match.lat), longitude: Number(match.lon) }
+      const formattedAddress = match.display_name || query
+      setNearMeLocation(coordinates)
+      setIsNearMeActive(true)
+      setAddressError('')
+      setAddressQuery(formattedAddress)
+      setVisibleIssueTypes(issueTypes)
+      setTypeFilter('all')
+    } catch (error) {
+      setAddressError(error instanceof Error ? error.message : 'Unable to find that address.')
+    } finally {
+      setIsGeocoding(false)
+    }
+  }
+
   function startPlacing() {
-    setDraftLocation(null)
+    const preferredLocation = draftLocation ?? null
+    setIssueType('pothole')
+    setDraftLocation(preferredLocation)
+    setDescription((current) => {
+      const trimmed = current.trim()
+      if (trimmed && !current.startsWith('Found a ')) return current
+      return buildAutoDescription('pothole', preferredLocation, addressQuery.trim() || null)
+    })
     setFormError('')
+    setReportPanelOpen(false)
     setIsPlacing(true)
   }
 
   function cancelPlacing() {
     setDraftLocation(null)
     setIsPlacing(false)
+    setReportPanelOpen(false)
     setFormError('')
+  }
+
+  function openMyReports() {
+    setMyReportsOpen((current) => !current)
+  }
+
+  function handleMyReportSelect(reportId: string) {
+    setSelectedMyReportId(reportId)
+    setMyReportsOpen(false)
+  }
+
+  function handleReportPanelPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if ((event.target as HTMLElement).closest('button, input, select, textarea, label')) return
+    const panel = reportPanelRef.current
+    if (!panel) return
+
+    const bounds = panel.getBoundingClientRect()
+    reportDragOffset.current = {
+      x: event.clientX - bounds.left,
+      y: event.clientY - bounds.top,
+    }
+    event.preventDefault()
   }
 
   function useMyLocation() {
     void getCurrentPosition()
-      .then((location) => {
+      .then(async (location) => {
+        const locationLabel = await getLocationAddressLabel(location)
+        setIssueType('pothole')
         setDraftLocation(location)
-        setIsPlacing(true)
+        setAddressQuery(locationLabel)
+        setDescription((current) => {
+          const trimmed = current.trim()
+          if (trimmed && !current.startsWith('Found a ')) return current
+          return buildAutoDescription('pothole', location, locationLabel)
+        })
+        setIsPlacing(false)
+        setReportPanelOpen(true)
         setFormError('')
       })
       .catch((error: unknown) => setFormError(error instanceof Error ? error.message : 'Unable to get your location.'))
@@ -510,7 +887,12 @@ function App() {
   async function showProblemsNearMe() {
     if (isNearMeActive) {
       setIsNearMeActive(false)
-      setNearMeLocation(null)
+      setNearMeError('')
+      return
+    }
+
+    if (nearMeLocation) {
+      setIsNearMeActive(true)
       setNearMeError('')
       return
     }
@@ -521,6 +903,9 @@ function App() {
       const location = await getCurrentPosition()
       setNearMeLocation(location)
       setIsNearMeActive(true)
+      if (!addressQuery.trim()) {
+        setAddressQuery('Your location')
+      }
     } catch (error) {
       setNearMeError(error instanceof Error ? error.message : 'Unable to get your location.')
     } finally {
@@ -529,9 +914,26 @@ function App() {
   }
 
   function toggleIssueType(issue: IssueType) {
-    setVisibleIssueTypes((current) =>
-      current.includes(issue) ? current.filter((visibleType) => visibleType !== issue) : [...current, issue],
-    )
+    setVisibleIssueTypes((current) => {
+      const nextVisible = current.includes(issue)
+        ? current.filter((visibleType) => visibleType !== issue)
+        : [...current, issue]
+
+      if (typeFilter !== 'all' && nextVisible.length === 0) {
+        setTypeFilter('all')
+      }
+
+      return nextVisible
+    })
+  }
+
+  function checkAllIssueTypes() {
+    setVisibleIssueTypes(issueTypes)
+    setTypeFilter('all')
+  }
+
+  function uncheckAllIssueTypes() {
+    setVisibleIssueTypes([])
   }
 
   async function submitReport(event: FormEvent<HTMLFormElement>) {
@@ -561,9 +963,11 @@ function App() {
       status: 'open',
       source: 'user',
       created_at: new Date().toISOString(),
+      address: formatReportLocation(draftLocation, addressQuery.trim() || null),
     }
 
     try {
+      let savedReport = report
       if (supabase) {
         const { data, error } = await supabase
           .from('reports')
@@ -581,20 +985,29 @@ function App() {
           .select('id, issue_type, description, severity, latitude, longitude, status, source, created_at, external_id')
           .single()
         if (error) throw new Error(`Could not save your report: ${error.message}`)
-        setUserReports((current) => [{
+        savedReport = {
           ...report,
           id: data.id,
           created_at: data.created_at,
           external_id: data.external_id,
-        }, ...current])
+        }
+        setUserReports((current) => [savedReport, ...current])
       } else {
         const nextReports = [report, ...userReports]
         localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(nextReports))
         setUserReports(nextReports)
       }
+
+      try {
+        await submitReportToApi(savedReport)
+      } catch (onlineError) {
+        console.warn('Online report logging failed.', onlineError)
+      }
+
       setDescription('')
       setDraftLocation(null)
       setIsPlacing(false)
+      setReportPanelOpen(false)
       setReportsError('')
     } catch (error) {
       setFormError(error instanceof Error ? error.message : 'Unable to save your report.')
@@ -614,40 +1027,49 @@ function App() {
         </a>
         <div className="topbar-right">
           <span className="live-indicator"><span /> PUBLIC DATA</span>
-          <button className={`top-report-button ${isPlacing ? 'active' : ''}`} onClick={isPlacing ? cancelPlacing : startPlacing} type="button">
-            {isPlacing ? <X size={15} /> : <Plus size={16} />}
-            {isPlacing ? 'Cancel report' : 'Report an issue'}
-          </button>
         </div>
       </header>
 
       <main className="workspace">
         <aside className="sidebar">
-          <div className="sidebar-heading">
-            <div className="eyebrow"><span className="eyebrow-line" /> CITY PULSE <span className="eyebrow-line" /></div>
-            <h1>Better streets<br /><span>start here.</span></h1>
-            <p className="intro">One shared view of the issues shaping our neighborhoods.</p>
-          </div>
-
           <section className="stats-grid" aria-label="Report statistics">
-            <div className="stat-card stat-total">
+            <button type="button" className={`stat-card stat-total ${statusFilter === 'all' ? 'active' : ''}`} onClick={() => toggleStatusFilter('all')}>
               <span className="stat-label">ON THE MAP</span>
-              <strong>{isLoading ? '—' : reports.length.toLocaleString()}</strong>
+              <strong>{isLoading ? '—' : summaryReports.length.toLocaleString()}</strong>
               <span className="stat-caption">total reports</span>
               <span className="stat-icon"><MapPin size={15} /></span>
-            </div>
-            <div className="stat-card">
+            </button>
+            <button type="button" className={`stat-card ${statusFilter === 'needs-attention' ? 'active' : ''}`} onClick={() => toggleStatusFilter('needs-attention')}>
               <span className="stat-label">NEEDS ATTENTION</span>
               <strong>{isLoading ? '—' : openCount.toLocaleString()}</strong>
               <span className="stat-caption">open issues</span>
               <span className="stat-icon attention"><ArrowUpRight size={15} /></span>
-            </div>
-            <div className="stat-card">
+            </button>
+            <button type="button" className={`stat-card ${statusFilter === 'resolved' ? 'active' : ''}`} onClick={() => toggleStatusFilter('resolved')}>
               <span className="stat-label">TAKEN CARE OF</span>
               <strong>{isLoading ? '—' : resolvedCount.toLocaleString()}</strong>
               <span className="stat-caption">resolved</span>
               <span className="stat-icon resolved"><Check size={15} /></span>
+            </button>
+          </section>
+
+          <section className="address-search-section">
+            <div className="section-title-row">
+              <h2><MapPin size={15} /> ADDRESS</h2>
             </div>
+            <form className="address-search-form" onSubmit={(event) => void searchAddress(event)}>
+              <input
+                type="text"
+                value={addressQuery}
+                onChange={(event) => setAddressQuery(event.target.value)}
+                placeholder="Search for an address"
+                aria-label="Search for an address on the map"
+              />
+              <button type="submit" disabled={isGeocoding}>
+                {isGeocoding ? <span className="button-spinner" /> : <Search size={14} />}
+              </button>
+            </form>
+            {addressError && <p className="inline-error address-error" role="alert"><AlertCircle size={14} /> {addressError}</p>}
           </section>
 
           <section className="filter-section">
@@ -682,7 +1104,13 @@ function App() {
               <ChevronDown size={15} />
             </div>
             <div className="issue-checklist" aria-label="Show issue types on the map">
-              <span className="field-label">SHOW ON MAP</span>
+              <div className="issue-checklist-header">
+                <span className="field-label">SHOW ON MAP</span>
+                <div className="issue-toggle-actions">
+                  <button type="button" className="issue-toggle-button" onClick={checkAllIssueTypes}>Check all</button>
+                  <button type="button" className="issue-toggle-button" onClick={uncheckAllIssueTypes}>Uncheck all</button>
+                </div>
+              </div>
               <div className="issue-checklist-items">
                 {issueTypes.map((type) => (
                   <label className="issue-checkbox" key={type}>
@@ -692,7 +1120,7 @@ function App() {
                       onChange={() => toggleIssueType(type)}
                     />
                     <span className="issue-checkbox-indicator" style={{ '--issue-color': issueColors[type] } as CSSProperties}>
-                      {visibleIssueTypes.includes(type) && <Check size={11} />}
+                      {visibleIssueTypes.includes(type) && <span className="issue-checkbox-dot" style={{ backgroundColor: '#fff' }} />}
                     </span>
                     <span>{issueLabel(type)}</span>
                   </label>
@@ -719,6 +1147,7 @@ function App() {
                 <div className="select-wrap">
                   <select id="status-filter" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as StatusFilter)}>
                     <option value="all">Any status</option>
+                    <option value="needs-attention">Needs attention</option>
                     <option value="open">Open</option>
                     <option value="in-progress">In progress</option>
                     <option value="resolved">Resolved</option>
@@ -766,50 +1195,6 @@ function App() {
               ))}
             </div>
             <div className="source-key"><span className="source-key-ring" /> Community report <span className="source-key-dot" /> City record</div>
-          </section>
-
-          <section className="my-reports-section" aria-labelledby="my-reports-title">
-            <div className="section-title-row">
-              <button
-                className={`my-reports-tab ${showMyReports ? 'active' : ''}`}
-                id="my-reports-title"
-                type="button"
-                aria-pressed={showMyReports}
-                onClick={() => {
-                  setShowMyReports((active) => !active)
-                  setSourceFilter(showMyReports ? 'all' : 'user')
-                }}
-              >
-                <ClipboardList size={15} /> MY REPORTS
-              </button>
-              <span className="result-count">{showMyReports ? filteredReports.length : userReports.length} {showMyReports ? 'SHOWN' : 'TOTAL'}</span>
-            </div>
-            {reportsLoading ? (
-              <div className="my-reports-empty"><span className="button-spinner" /> Loading reports</div>
-            ) : userReports.length === 0 ? (
-              <div className="my-reports-empty">
-                <span>No community reports yet.</span>
-                <button type="button" onClick={startPlacing}>Report an issue <ArrowUpRight size={12} /></button>
-              </div>
-            ) : (
-              <div className="my-reports-list">
-                {userReports.slice(0, 5).map((report) => (
-                  <div className="my-report-card" key={report.id}>
-                    <span className="my-report-dot" style={{ backgroundColor: issueColors[report.issue_type] }} />
-                    <div className="my-report-details">
-                      <div className="my-report-heading">
-                        <strong>{issueLabel(report.issue_type)}</strong>
-                        <span className={`my-report-status ${report.status}`}>{statusLabel(report.status)}</span>
-                      </div>
-                      {report.status !== 'resolved' && <span className="my-report-age">{reportAgeLabel(report)}</span>}
-                      <p>{report.description}</p>
-                      <span className="my-report-date">{new Date(report.created_at).toLocaleDateString()}</span>
-                    </div>
-                  </div>
-                ))}
-                {userReports.length > 5 && <span className="my-reports-more">Showing 5 of {userReports.length} reports</span>}
-              </div>
-            )}
           </section>
 
           {isPlacing && (
@@ -899,24 +1284,25 @@ function App() {
                 : 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png'}
               subdomains={cartoBasemapKey ? 'abcd' : 'abc'}
             />
-            <MapClickHandler enabled={isPlacing} onSelect={(latitude, longitude) => {
-              setDraftLocation({ latitude, longitude })
+            <MapClickHandler enabled={isPlacing} onSelect={async (latitude, longitude) => {
+              const location = { latitude, longitude }
+              setDraftLocation(location)
               setFormError('')
+              setAddressQuery(await getLocationAddressLabel(location))
+              setReportPanelOpen(true)
+              setIsPlacing(false)
             }} />
             <RecenterButton />
+            <MyReportsMapController report={selectedMyReport} />
             <NearbyMapController active={isNearMeActive} location={nearMeLocation} reports={filteredReports} />
-            {isNearMeActive && nearMeLocation && (
+            {nearMeLocation && (
               <>
                 <CircleMarker
                   center={[nearMeLocation.latitude, nearMeLocation.longitude]}
                   radius={16}
                   pathOptions={{ color: '#567052', fillColor: '#ffffff', fillOpacity: 0.92, weight: 3 }}
                 />
-                <CircleMarker
-                  center={[nearMeLocation.latitude, nearMeLocation.longitude]}
-                  radius={5}
-                  pathOptions={{ color: '#567052', fillColor: '#567052', fillOpacity: 1, weight: 1 }}
-                />
+                <UserLocationMarker location={nearMeLocation} label={addressQuery || 'Your location'} />
               </>
             )}
             {filteredReports.map((report) => <ReportMarker key={report.id} report={report} />)}
@@ -928,9 +1314,105 @@ function App() {
               />
             )}
           </MapContainer>
+          <div className="map-fab-stack">
+            <button className={`top-report-button map-report-button ${isPlacing ? 'active' : ''}`} onClick={isPlacing ? cancelPlacing : startPlacing} type="button" aria-label={isPlacing ? 'Cancel report' : 'Report an issue'}>
+              {isPlacing ? <X size={15} /> : <Plus size={16} />}
+              {isPlacing ? 'Cancel report' : 'Report an issue'}
+            </button>
+            <button className="map-report-button my-reports-button" type="button" onClick={openMyReports}>
+              <MapPin size={15} />
+              My Reports
+            </button>
+          </div>
+          {myReportsOpen && (
+            <div className="my-reports-panel">
+              <div className="my-reports-header">
+                <span>MY REPORTS</span>
+                <button type="button" aria-label="Close My Reports" onClick={() => setMyReportsOpen(false)}><X size={15} /></button>
+              </div>
+              {myReports.length === 0 ? (
+                <p className="my-reports-empty">No reports yet.</p>
+              ) : (
+                <ul className="my-reports-list">
+                  {myReports.map((report) => (
+                    <li key={report.id}>
+                      <button type="button" className="my-report-item" onClick={() => handleMyReportSelect(report.id)}>
+                        <span className="my-report-item-main">
+                          <strong>{issueLabel(report.issue_type)}</strong>
+                          <small>{statusLabel(report.status)}</small>
+                        </span>
+                        <span className="my-report-item-meta">{new Date(report.created_at).toLocaleDateString()}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+          {reportPanelOpen && (
+            <div ref={reportPanelRef} className="report-panel" style={{ left: reportPanelPosition.x, top: reportPanelPosition.y }}>
+              <div className="report-panel-header" onPointerDown={handleReportPanelPointerDown}>
+                <div className="report-panel-grip" aria-hidden="true" />
+                <span>NEW COMMUNITY REPORT</span>
+                <button className="icon-button" type="button" aria-label="Cancel report" onClick={cancelPlacing}><X size={16} /></button>
+              </div>
+              <div className="report-panel-body">
+                <p className="form-hint">{draftLocation ? 'Location pinned. Add a few details.' : 'Click anywhere on the map to drop a pin.'}</p>
+                {draftLocation && (
+                  <div className="selected-location">
+                    <MapPin size={14} />
+                    <span>{addressQuery.trim() || `${draftLocation.latitude.toFixed(5)}, ${draftLocation.longitude.toFixed(5)}`}</span>
+                    <button type="button" onClick={useMyLocation}><LocateFixed size={14} /> Use my location</button>
+                  </div>
+                )}
+                <form className="report-form" onSubmit={(event) => void submitReport(event)}>
+                  <label className="field-label" htmlFor="report-type">ISSUE TYPE</label>
+                  <div className="select-wrap">
+                    <select id="report-type" value={issueType} onChange={(event) => setIssueType(event.target.value as IssueType)}>
+                      {issueTypes.map((type) => <option value={type} key={type}>{issueLabel(type)}</option>)}
+                    </select>
+                    <ChevronDown size={15} />
+                  </div>
+                  <label className="field-label" htmlFor="report-description">WHAT DID YOU NOTICE?</label>
+                  <textarea
+                    id="report-description"
+                    value={description}
+                    onChange={(event) => setDescription(event.target.value)}
+                    minLength={5}
+                    maxLength={500}
+                    placeholder="Share a helpful detail, like a nearby cross street."
+                    rows={3}
+                    required
+                  />
+                  <div className="form-bottom-row">
+                    <label className="severity-field">
+                      <span className="field-label">SEVERITY</span>
+                      <span className="select-wrap">
+                        <select value={severity} onChange={(event) => setSeverity(event.target.value as Severity)} aria-label="Severity">
+                          <option value="low">Low</option>
+                          <option value="medium">Medium</option>
+                          <option value="high">High</option>
+                        </select>
+                        <ChevronDown size={15} />
+                      </span>
+                    </label>
+                    <span className="character-count">{description.length}/500</span>
+                  </div>
+                  {formError && <p className="inline-error" role="alert"><AlertCircle size={14} /> {formError}</p>}
+                  <button className="submit-button" type="submit" disabled={isSaving}>
+                    {isSaving ? <><span className="button-spinner" /> Saving report…</> : <><MapPin size={15} /> Add to the map <ArrowUpRight size={15} /></>}
+                  </button>
+                  {!supabase && <p className="storage-note">Saved in this browser. Add Supabase keys to share across devices.</p>}
+                </form>
+              </div>
+            </div>
+          )}
           <div className="map-overlay map-overlay-top"><span className="map-area-dot" /> SACRAMENTO <span className="map-overlay-divider">/</span> CENTRAL CITY</div>
           <div className="map-overlay map-overlay-bottom"><span>38°34'54.0"N&nbsp; 121°29'39.8"W</span><span className="map-overlay-divider">·</span><span>MAP DATA © OPENSTREETMAP</span></div>
           {isPlacing && !draftLocation && <div className="map-instruction"><ArrowDown size={15} /> Click the map to place your report</div>}
+          {isPlacing && draftLocation && !reportPanelOpen && (
+            <div className="map-instruction"><MapPin size={15} /> Location selected — complete the report below</div>
+          )}
           {cityLoading && <div className="map-loading"><span className="button-spinner" /> Loading public records</div>}
           {filteredReports.length === 0 && !isLoading && !cityError && (
             <div className="empty-map"><MapPin size={18} /><strong>Nothing to show here</strong><span>Try adjusting your filters or add a report.</span></div>
