@@ -20,11 +20,11 @@ The map and public City records work without API keys. Until Supabase is configu
 ## What is on the map
 
 - The public source is the [City of Sacramento 311 Repairs ArcGIS service](https://services5.arcgis.com/54falWtcpty3V47Z/arcgis/rest/services/311_Repairs_WFL1/FeatureServer). Its public layers contain pothole repairs and street-light fixes.
-- To keep the map responsive, it loads the 100 most recently updated records from each City layer, caches them in this browser for 30 minutes, and draws report markers on a canvas.
+- To keep the map responsive, it initially loads a recent sample of City records and caches it in this browser for 30 minutes. The timeline reads the full date extent from the City 311 layer and fetches currently open or in-progress records for the selected range in paginated requests.
 - These are repair records, not a feed of current open work orders. The prototype presents them as resolved City records and does not submit reports to the City.
 - The basemap uses CARTO's Voyager tiles with your CARTO Basemaps key when configured; without a key, it falls back to CARTO's public light tiles.
 - On opening the map, your browser asks whether to share your location. If allowed, the map centers on you and shows loaded reports within 5 km; if denied, Sacramento remains the default map location. You can change the nearby filter at any time. The map only searches reports currently loaded by the prototype.
-- Use the issue-type checkboxes to show or hide each category. Filter by type, source, status, or time (any time, the last 90 days, or a custom date range). Click **Report an issue**, click a location on the map, fill out the form, and submit.
+- Use the issue-type checkboxes to show or hide each category. Filter by type and source, and use the dashboard timeline to choose a date range. Timeline stops use the 1st, 15th, and last day of each month; the default range is the last 90 days. The timeline queries the City 311 layer for matching history, and resolved reports are hidden. Click **Report an issue**, click a location on the map, fill out the form, and submit.
 
 ## Use Supabase (optional)
 

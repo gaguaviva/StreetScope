@@ -25,7 +25,6 @@ type ReportStatus = 'open' | 'in-progress' | 'resolved'
 type ReportSource = 'user' | 'city-of-sacramento'
 type SourceFilter = 'all' | ReportSource
 type StatusFilter = 'all' | ReportStatus | 'needs-attention'
-type DateFilter = 'all' | 'last-90-days' | 'custom'
 interface Coordinates {
   latitude: number
   longitude: number
@@ -53,19 +52,25 @@ interface ArcGisFeatureCollection {
     properties?: Record<string, unknown>
   }>
   error?: { message?: string }
+  exceededTransferLimit?: boolean
+}
+
+interface ArcGisDateExtent {
+  features?: Array<{ attributes?: { earliestDate?: number | null } }>
+  error?: { message?: string }
 }
 
 const CITY_LAYER_URL = appConfig.cityLayerUrl
 const LEGACY_CITY_LAYER_URL = appConfig.legacyCityLayerUrl
 const CITY_CACHE_KEY = 'sacramento-city-repair-cache'
 const CITY_CACHE_TTL_MS = 30 * 60 * 1000
+const CITY_PAGE_SIZE = 2000
 const LOCAL_STORAGE_KEY = 'sacramento-infrastructure-reports'
 const LOCAL_CONFIRMATIONS_KEY = 'sacramento-infrastructure-confirmations'
 const CONFIRMER_ID_KEY = 'sacramento-infrastructure-confirmer-id'
 const CONFIRMATION_THRESHOLD = 3
 const NEARBY_RADIUS_KM = 5
 const NEAR_DUPLICATE_RADIUS_KM = 1
-const LAST_90_DAYS_MS = 90 * 24 * 60 * 60 * 1000
 const issueTypes: IssueType[] = [
   'pothole',
   'streetlight',
@@ -192,12 +197,6 @@ function getCurrentPosition(): Promise<Coordinates> {
   return pendingRequest
 }
 
-function customRangeError(startDate: string, endDate: string) {
-  if (!startDate && !endDate) return 'Choose a start date, an end date, or both.'
-  if (startDate && endDate && startDate > endDate) return 'The start date must be on or before the end date.'
-  return ''
-}
-
 function formatReportLocation(location: Coordinates | null, locationLabel?: string | null) {
   const cleanedLabel = locationLabel?.trim()
   if (cleanedLabel) return cleanedLabel
@@ -213,15 +212,54 @@ function reportLocationLabel(report: Report) {
   return `${report.latitude.toFixed(5)}, ${report.longitude.toFixed(5)}`
 }
 
-function isWithinCustomDateRange(report: Report, startDate: string, endDate: string) {
+function isWithinDateRange(report: Report, startDate: string, endDate: string) {
   const reportTime = Date.parse(report.created_at)
   if (!Number.isFinite(reportTime)) return false
 
-  const rangeStart = startDate ? new Date(`${startDate}T00:00:00`).getTime() : Number.NEGATIVE_INFINITY
-  const rangeEnd = endDate
-    ? new Date(`${endDate}T00:00:00`).getTime() + 24 * 60 * 60 * 1000 - 1
-    : Number.POSITIVE_INFINITY
-  return reportTime >= rangeStart && reportTime <= rangeEnd
+  const rangeStart = Date.parse(`${startDate}T00:00:00.000Z`)
+  const rangeEndExclusive = Date.parse(`${endDate}T00:00:00.000Z`) + 24 * 60 * 60 * 1000
+  return reportTime >= rangeStart && reportTime < rangeEndExclusive
+}
+
+function createTimelineDates(reports: Report[], cityStartDate: string | null) {
+  const now = new Date()
+  const today = now.toISOString().slice(0, 10)
+  const timestamps = reports
+    .map((report) => Date.parse(report.created_at))
+    .filter(Number.isFinite)
+  const reportStartDate = timestamps.length > 0
+    ? new Date(Math.min(...timestamps)).toISOString().slice(0, 10)
+    : null
+  const firstDate = [cityStartDate, reportStartDate].filter((date): date is string => date !== null).sort()[0]
+    || new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+  const earliest = new Date(`${firstDate}T00:00:00.000Z`)
+  const dates: string[] = [firstDate]
+
+  for (let year = earliest.getUTCFullYear(), month = earliest.getUTCMonth(); ; ) {
+    const lastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate()
+    for (const day of [1, 15, lastDay]) {
+      const date = new Date(Date.UTC(year, month, day)).toISOString().slice(0, 10)
+      if (date <= today && !dates.includes(date)) dates.push(date)
+    }
+
+    if (year === now.getUTCFullYear() && month === now.getUTCMonth()) break
+    month += 1
+    if (month > 11) {
+      month = 0
+      year += 1
+    }
+  }
+
+  if (!dates.includes(today)) dates.push(today)
+  return dates
+}
+
+function formatTimelineDate(date: string) {
+  return new Date(`${date}T12:00:00`).toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  })
 }
 
 function coordinatesFor(feature: NonNullable<ArcGisFeatureCollection['features']>[number]) {
@@ -305,6 +343,10 @@ async function fetchCityLayer(layer: number, signal: AbortSignal): Promise<Repor
   const collection = await response.json() as ArcGisFeatureCollection
   if (collection.error) throw new Error(collection.error.message || 'The City of Sacramento data service returned an error.')
 
+  return mapCityFeatures(collection, layer)
+}
+
+function mapCityFeatures(collection: ArcGisFeatureCollection, layer: number): Report[] {
   return (collection.features || []).flatMap((feature) => {
     const position = coordinatesFor(feature)
     if (!position) return []
@@ -336,6 +378,63 @@ async function fetchCityLayer(layer: number, signal: AbortSignal): Promise<Repor
       address: location || undefined,
     }]
   })
+}
+
+async function fetchCityTimelineStart(signal: AbortSignal): Promise<string> {
+  const query = new URLSearchParams({
+    where: '1=1',
+    outStatistics: JSON.stringify([{
+      statisticType: 'min',
+      onStatisticField: 'DateCreated',
+      outStatisticFieldName: 'earliestDate',
+    }]),
+    returnGeometry: 'false',
+    f: 'json',
+  })
+  const response = await fetch(`${CITY_LAYER_URL}/0/query?${query}`, { signal })
+  if (!response.ok) throw new Error(`City date range request failed (${response.status}).`)
+
+  const result = await response.json() as ArcGisDateExtent
+  if (result.error) throw new Error(result.error.message || 'The City of Sacramento date range could not be loaded.')
+  const earliestDate = result.features?.[0]?.attributes?.earliestDate
+  if (typeof earliestDate !== 'number' || !Number.isFinite(earliestDate)) {
+    throw new Error('The City of Sacramento data source did not return a valid historical date range.')
+  }
+  return new Date(earliestDate).toISOString().slice(0, 10)
+}
+
+async function fetchHistoricalCityReports(startDate: string, endDate: string, signal: AbortSignal): Promise<Report[]> {
+  const endExclusive = new Date(Date.parse(`${endDate}T00:00:00.000Z`) + 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10)
+  const where = `DateCreated >= TIMESTAMP '${startDate} 00:00:00' AND DateCreated < TIMESTAMP '${endExclusive} 00:00:00' AND (PublicStatus IS NULL OR UPPER(PublicStatus) <> 'CLOSED')`
+  const reports: Report[] = []
+  let resultOffset = 0
+
+  while (true) {
+    const query = new URLSearchParams({
+      where,
+      outFields: 'OBJECTID,CategoryName,CategoryLevel1,CategoryLevel2,PublicStatus,DateCreated,DateUpdated,Address,CrossStreet,Neighborhood',
+      returnGeometry: 'true',
+      outSR: '4326',
+      geometryPrecision: '5',
+      resultRecordCount: String(CITY_PAGE_SIZE),
+      resultOffset: String(resultOffset),
+      orderByFields: 'DateCreated ASC, OBJECTID ASC',
+      f: 'geojson',
+    })
+    const response = await fetch(`${CITY_LAYER_URL}/0/query?${query}`, { signal })
+    if (!response.ok) throw new Error(`Historical City data request failed (${response.status}).`)
+
+    const collection = await response.json() as ArcGisFeatureCollection
+    if (collection.error) throw new Error(collection.error.message || 'Historical City data could not be loaded.')
+    const features = collection.features || []
+    reports.push(...mapCityFeatures(collection, 0))
+    if (features.length === 0 || (features.length < CITY_PAGE_SIZE && !collection.exceededTransferLimit)) break
+    resultOffset += features.length
+  }
+
+  return reports
 }
 
 async function fetchLegacyCityLayer(layer: number, signal: AbortSignal): Promise<Report[]> {
@@ -723,6 +822,8 @@ function UserLocationMarker({ location, label }: { location: Coordinates; label:
 
 function App() {
   const [cityReports, setCityReports] = useState<Report[]>([])
+  const [historicalCityReports, setHistoricalCityReports] = useState<Report[]>([])
+  const [cityStartDate, setCityStartDate] = useState<string | null>(null)
   const [userReports, setUserReports] = useState<Report[]>([])
   const [confirmerId, setConfirmerId] = useState('')
   const [confirmedReportIds, setConfirmedReportIds] = useState<Set<string>>(new Set())
@@ -737,9 +838,7 @@ function App() {
   const [visibleIssueTypes, setVisibleIssueTypes] = useState<IssueType[]>(issueTypes)
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
-  const [dateFilter, setDateFilter] = useState<DateFilter>('last-90-days')
-  const [customStartDate, setCustomStartDate] = useState('')
-  const [customEndDate, setCustomEndDate] = useState('')
+  const [timelineRange, setTimelineRange] = useState<{ start: number; end: number } | null>(null)
   const [deviceLocation, setDeviceLocation] = useState<Coordinates | null>(null)
   const [nearMeLocation, setNearMeLocation] = useState<Coordinates | null>(null)
   const [isNearMeActive, setIsNearMeActive] = useState(false)
@@ -841,27 +940,29 @@ function App() {
   }, [draftLocation, issueType, addressQuery])
 
   useEffect(() => {
-    const cachedReports = getCachedCityReports()
-    if (cachedReports) {
-      setCityReports(cachedReports)
-      setCityLoading(false)
-      return
-    }
-
     let active = true
-    loadCityReports()
-      .then((reports) => {
-        if (active) setCityReports(reports)
+    const controller = new AbortController()
+    const cachedReports = getCachedCityReports()
+    Promise.all([
+      cachedReports ? Promise.resolve(cachedReports) : loadCityReports(),
+      fetchCityTimelineStart(controller.signal),
+    ])
+      .then(([reports, startDate]) => {
+        if (!active) return
+        setCityReports(reports)
+        setCityStartDate(startDate)
+        setTimelineRange(null)
       })
       .catch((error: unknown) => {
-        if (active) {
-          setCityError(error instanceof Error ? error.message : 'Unable to load City of Sacramento data.')
-        }
+        if (active) setCityError(error instanceof Error ? error.message : 'Unable to load City of Sacramento data.')
       })
       .finally(() => {
         if (active) setCityLoading(false)
       })
-    return () => { active = false }
+    return () => {
+      active = false
+      controller.abort()
+    }
   }, [])
 
   useEffect(() => {
@@ -910,27 +1011,72 @@ function App() {
     return () => { active = false }
   }, [])
 
-  const selectedCustomRangeError = dateFilter === 'custom'
-    ? customRangeError(customStartDate, customEndDate)
-    : ''
-  const reports = useMemo(() => [...userReports, ...cityReports], [userReports, cityReports])
+  const reports = useMemo(() => {
+    const reportsById = new Map<string, Report>()
+    for (const report of [...cityReports, ...historicalCityReports, ...userReports]) {
+      reportsById.set(report.id, report)
+    }
+    return [...reportsById.values()]
+  }, [userReports, cityReports, historicalCityReports])
+  const timelineDates = useMemo(() => createTimelineDates(userReports, cityStartDate), [userReports, cityStartDate])
+  const timelineEndIndex = timelineDates.length - 1
+  const defaultTimelineStartDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+  let defaultTimelineStartIndex = 0
+  for (let index = 0; index < timelineDates.length; index += 1) {
+    if (timelineDates[index] > defaultTimelineStartDate) break
+    defaultTimelineStartIndex = index
+  }
+  const timelineStartIndex = timelineRange
+    ? Math.min(timelineRange.start, timelineEndIndex)
+    : defaultTimelineStartIndex
+  const timelineSelectedEndIndex = timelineRange
+    ? Math.max(timelineStartIndex, Math.min(timelineRange.end, timelineEndIndex))
+    : timelineEndIndex
+  const timelineStartDate = timelineDates[timelineStartIndex]
+  const timelineEndDate = timelineDates[timelineSelectedEndIndex]
+
+  useEffect(() => {
+    if (!cityStartDate || !timelineStartDate || !timelineEndDate) return
+
+    let active = true
+    const controller = new AbortController()
+    setCityLoading(true)
+    setCityError('')
+    setHistoricalCityReports([])
+
+    fetchHistoricalCityReports(timelineStartDate, timelineEndDate, controller.signal)
+      .then((reports) => {
+        if (active) setHistoricalCityReports(reports)
+      })
+      .catch((error: unknown) => {
+        if (active && !controller.signal.aborted) {
+          setCityError(error instanceof Error ? error.message : 'Unable to load historical City reports.')
+        }
+      })
+      .finally(() => {
+        if (active) setCityLoading(false)
+      })
+
+    return () => {
+      active = false
+      controller.abort()
+    }
+  }, [cityStartDate, timelineStartDate, timelineEndDate])
+
   const summaryReports = useMemo(() => reports.filter((report) =>
     (typeFilter === 'all' || report.issue_type === typeFilter) &&
     visibleIssueTypes.includes(report.issue_type) &&
     (sourceFilter === 'all' || report.source === sourceFilter) &&
-    (dateFilter === 'all' ||
-      (dateFilter === 'last-90-days' && Date.parse(report.created_at) >= Date.now() - LAST_90_DAYS_MS) ||
-      (dateFilter === 'custom' && (
-        !customStartDate && !customEndDate ||
-        (!selectedCustomRangeError && isWithinCustomDateRange(report, customStartDate, customEndDate))
-      ))) &&
+    isWithinDateRange(report, timelineStartDate, timelineEndDate) &&
     (!isNearMeActive || !nearMeLocation || distanceInKilometers(nearMeLocation, report) <= NEARBY_RADIUS_KM),
-  ), [reports, typeFilter, visibleIssueTypes, sourceFilter, dateFilter, customStartDate, customEndDate, selectedCustomRangeError, isNearMeActive, nearMeLocation])
+  ), [reports, typeFilter, visibleIssueTypes, sourceFilter, timelineStartDate, timelineEndDate, isNearMeActive, nearMeLocation])
 
   const filteredReports = useMemo(() => summaryReports.filter((report) =>
-    statusFilter === 'all' ||
-    (statusFilter === 'needs-attention' ? report.status !== 'resolved' : report.status === statusFilter),
-  ), [summaryReports, statusFilter])
+    (statusFilter === 'resolved'
+      ? report.status === 'resolved'
+      : (report.status !== 'resolved' || (statusFilter === 'all' && report.id === selectedMyReportId)) &&
+        (statusFilter === 'all' || statusFilter === 'needs-attention' || report.status === statusFilter)),
+  ), [summaryReports, statusFilter, selectedMyReportId])
 
   const myReports = useMemo(
     () => userReports.filter((report) => report.source === 'user').slice(0, 20),
@@ -1077,7 +1223,17 @@ function App() {
     setVisibleIssueTypes((current) => current.includes(report.issue_type) ? current : [...current, report.issue_type])
     setSourceFilter('all')
     setStatusFilter('all')
-    setDateFilter('all')
+    const reportDate = report.created_at.slice(0, 10)
+    let start = 0
+    let end = timelineEndIndex
+    for (let index = 0; index < timelineDates.length; index += 1) {
+      if (timelineDates[index] <= reportDate) start = index
+      if (timelineDates[index] >= reportDate) {
+        end = index
+        break
+      }
+    }
+    setTimelineRange({ start, end })
     setIsNearMeActive(false)
     setSelectedMyReportId(reportId)
     setMyReportsOpen(false)
@@ -1474,32 +1630,53 @@ function App() {
                 </div>
               </div>
             </div>
-            <label className="field-label time-filter-label" htmlFor="date-filter">TIME PERIOD</label>
-            <div className="select-wrap">
-              <select id="date-filter" value={dateFilter} onChange={(event) => setDateFilter(event.target.value as DateFilter)}>
-                <option value="all">Any time</option>
-                <option value="last-90-days">Within the last 90 days</option>
-                <option value="custom">Custom date range</option>
-              </select>
-              <ChevronDown size={15} />
-            </div>
-            {dateFilter === 'custom' && (
-              <div className="custom-date-range">
-                <label>
-                  <span className="field-label">FROM</span>
-                  <input type="date" value={customStartDate} onChange={(event) => setCustomStartDate(event.target.value)} />
-                </label>
-                <label>
-                  <span className="field-label">TO</span>
-                  <input type="date" value={customEndDate} onChange={(event) => setCustomEndDate(event.target.value)} />
-                </label>
-                {selectedCustomRangeError && (
-                  <p className="inline-error date-range-error" role="alert">
-                    <AlertCircle size={14} /> {selectedCustomRangeError}
-                  </p>
-                )}
+            <section className="timeline-section" aria-label="Filter currently unresolved reports by date">
+              <div className="timeline-heading">
+                <span className="field-label">NEEDS ATTENTION TIMELINE</span>
+                <span className="timeline-step-note">1st · 15th · month end</span>
               </div>
-            )}
+              <div className="timeline-dates" aria-live="polite">
+                <span><small>START</small>{formatTimelineDate(timelineStartDate)}</span>
+                <span><small>END</small>{formatTimelineDate(timelineEndDate)}</span>
+              </div>
+              <div className="timeline-range">
+                <div className="timeline-track" />
+                <div
+                  className="timeline-track-selected"
+                  style={{
+                    left: `${timelineEndIndex ? timelineStartIndex / timelineEndIndex * 100 : 0}%`,
+                    right: `${timelineEndIndex ? (timelineEndIndex - timelineSelectedEndIndex) / timelineEndIndex * 100 : 0}%`,
+                  }}
+                />
+                <input
+                  aria-label="Start date"
+                  aria-valuetext={formatTimelineDate(timelineStartDate)}
+                  type="range"
+                  min={0}
+                  max={timelineEndIndex}
+                  value={timelineStartIndex}
+                  disabled={!cityStartDate || timelineEndIndex === 0}
+                  onChange={(event) => setTimelineRange({
+                    start: Math.min(Number(event.target.value), timelineSelectedEndIndex),
+                    end: timelineSelectedEndIndex,
+                  })}
+                />
+                <input
+                  aria-label="End date"
+                  aria-valuetext={formatTimelineDate(timelineEndDate)}
+                  type="range"
+                  min={0}
+                  max={timelineEndIndex}
+                  value={timelineSelectedEndIndex}
+                  disabled={!cityStartDate || timelineEndIndex === 0}
+                  onChange={(event) => setTimelineRange({
+                    start: timelineStartIndex,
+                    end: Math.max(Number(event.target.value), timelineStartIndex),
+                  })}
+                />
+              </div>
+              <p className="timeline-caption">Currently unresolved issues created in this range. Drag the handles to explore the timeline.</p>
+            </section>
           </section>
 
           {isPlacing && (
