@@ -343,7 +343,6 @@ function App() {
   const [reportsLoading, setReportsLoading] = useState(true)
   const [cityError, setCityError] = useState('')
   const [reportsError, setReportsError] = useState('')
-  const [typeFilter, setTypeFilter] = useState<IssueType | 'all'>('all')
   const [visibleIssueTypes, setVisibleIssueTypes] = useState<IssueType[]>(issueTypes)
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
@@ -361,28 +360,6 @@ function App() {
   const [severity, setSeverity] = useState<Severity>('medium')
   const [isSaving, setIsSaving] = useState(false)
   const [formError, setFormError] = useState('')
-
-  useEffect(() => {
-    let active = true
-    setIsLocating(true)
-    setNearMeError('')
-
-    void getCurrentPosition()
-      .then((location) => {
-        if (active) {
-          setNearMeLocation(location)
-          setIsNearMeActive(true)
-        }
-      })
-      .catch((error: unknown) => {
-        if (active) setNearMeError(error instanceof Error ? error.message : 'Unable to get your location.')
-      })
-      .finally(() => {
-        if (active) setIsLocating(false)
-      })
-
-    return () => { active = false }
-  }, [])
 
   useEffect(() => {
     const cachedReports = getCachedCityReports()
@@ -455,7 +432,6 @@ function App() {
     : ''
   const reports = useMemo(() => [...userReports, ...cityReports], [userReports, cityReports])
   const filteredReports = useMemo(() => reports.filter((report) =>
-    (typeFilter === 'all' || report.issue_type === typeFilter) &&
     visibleIssueTypes.includes(report.issue_type) &&
     (sourceFilter === 'all' || report.source === sourceFilter) &&
     (statusFilter === 'all' || report.status === statusFilter) &&
@@ -466,7 +442,7 @@ function App() {
         (!selectedCustomRangeError && isWithinCustomDateRange(report, customStartDate, customEndDate))
       ))) &&
     (!isNearMeActive || !nearMeLocation || distanceInKilometers(nearMeLocation, report) <= NEARBY_RADIUS_KM),
-  ), [reports, typeFilter, visibleIssueTypes, sourceFilter, statusFilter, dateFilter, customStartDate, customEndDate, selectedCustomRangeError, isNearMeActive, nearMeLocation])
+  ), [reports, visibleIssueTypes, sourceFilter, statusFilter, dateFilter, customStartDate, customEndDate, selectedCustomRangeError, isNearMeActive, nearMeLocation])
 
   const openCount = reports.filter((report) => report.status !== 'resolved').length
   const resolvedCount = reports.length - openCount
@@ -660,14 +636,6 @@ function App() {
                   : 'No matching problems within 5 km. Try enabling more issue types.'}
               </p>
             )}
-            <label className="field-label" htmlFor="type-filter">ISSUE TYPE</label>
-            <div className="select-wrap">
-              <select id="type-filter" value={typeFilter} onChange={(event) => setTypeFilter(event.target.value as IssueType | 'all')}>
-                <option value="all">All issue types</option>
-                {issueTypes.map((type) => <option value={type} key={type}>{issueLabel(type)}</option>)}
-              </select>
-              <ChevronDown size={15} />
-            </div>
             <div className="issue-checklist" aria-label="Show issue types on the map">
               <span className="field-label">SHOW ON MAP</span>
               <div className="issue-checklist-items">
@@ -872,8 +840,6 @@ function App() {
               />
             )}
           </MapContainer>
-          <div className="map-overlay map-overlay-top"><span className="map-area-dot" /> SACRAMENTO <span className="map-overlay-divider">/</span> CENTRAL CITY</div>
-          <div className="map-overlay map-overlay-bottom"><span>38°34'54.0"N&nbsp; 121°29'39.8"W</span><span className="map-overlay-divider">·</span><span>MAP DATA © OPENSTREETMAP</span></div>
           {isPlacing && !draftLocation && <div className="map-instruction"><ArrowDown size={15} /> Click the map to place your report</div>}
           {cityLoading && <div className="map-loading"><span className="button-spinner" /> Loading public records</div>}
           {filteredReports.length === 0 && !isLoading && !cityError && (
