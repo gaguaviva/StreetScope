@@ -15,7 +15,7 @@ A React + Vite prototype that brings City of Sacramento repair records and commu
 
 4. Open the local URL Vite prints in the terminal.
 
-The map and public City records work without API keys. Until Supabase is configured, community reports are stored in the current browser's local storage and survive a page refresh on that device.
+The map and public City records work without API keys. Until Supabase is configured, community reports are stored in the current browser's local storage and survive a page refresh on that device. Browser-local reports can be permanently deleted from **My Reports**; deletion is unavailable for Supabase reports until report ownership is configured.
 
 ## What is on the map
 
