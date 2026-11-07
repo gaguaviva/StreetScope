@@ -20,15 +20,17 @@ The map and public City records work without API keys. Until Supabase is configu
 ## What is on the map
 
 - The public source is the [City of Sacramento 311 Repairs ArcGIS service](https://services5.arcgis.com/54falWtcpty3V47Z/arcgis/rest/services/311_Repairs_WFL1/FeatureServer). Its public layers contain pothole repairs and street-light fixes.
-- To keep the map responsive, it loads the 100 most recently updated records from each City layer, caches them in this browser for 30 minutes, and draws report markers on a canvas.
+- To keep the map responsive, it initially loads a recent sample of City records and caches it in this browser for 30 minutes. The timeline reads the full date extent from the City 311 layer and fetches currently open or in-progress records for the selected range in paginated requests.
 - These are repair records, not a feed of current open work orders. The prototype presents them as resolved City records and does not submit reports to the City.
 - The basemap uses CARTO's Voyager tiles with your CARTO Basemaps key when configured; without a key, it falls back to CARTO's public light tiles.
 - On opening the map, your browser asks whether to share your location. If allowed, the map centers on you and shows loaded reports within 5 km; if denied, Sacramento remains the default map location. You can change the nearby filter at any time. The map only searches reports currently loaded by the prototype.
-- Use the issue-type checkboxes to show or hide each category. Filter by type, source, status, or time (any time, the last 90 days, or a custom date range). Click **Report an issue**, click a location on the map, fill out the form, and submit.
+- Use the issue-type checkboxes to show or hide each category. Filter by type and source, and use the dashboard timeline to choose a date range. Timeline stops use the 1st, 15th, and last day of each month; the default range is the last 90 days. The timeline queries the City 311 layer for matching history, and resolved reports are hidden. Click **Report an issue**, click a location on the map, fill out the form, and submit.
 
 ## Use Supabase (optional)
 
 Create a free Supabase project, open its SQL Editor, and run:
+
+If you already created the `reports` table using an earlier version of this guide, run the confirmation migration statements starting at `alter table public.reports` instead.
 
 ```sql
 create table public.reports (
@@ -41,6 +43,7 @@ create table public.reports (
   longitude double precision not null check (longitude between -180 and 180),
   status text not null default 'open' check (status in ('open', 'in-progress', 'resolved')),
   source text not null default 'user' check (source in ('user', 'city-of-sacramento')),
+  confirmation_count integer not null default 0 check (confirmation_count >= 0),
   external_id text unique
 );
 
@@ -53,7 +56,51 @@ create policy "Anyone can read reports"
 create policy "Anyone can add community reports"
   on public.reports for insert
   with check (source = 'user');
+
+alter table public.reports
+  add column if not exists confirmation_count integer not null default 0 check (confirmation_count >= 0);
+
+create table if not exists public.report_confirmations (
+  report_id uuid not null references public.reports(id) on delete cascade,
+  confirmer_id text not null,
+  created_at timestamptz not null default now(),
+  primary key (report_id, confirmer_id)
+);
+
+alter table public.report_confirmations enable row level security;
+
+drop policy if exists "Anyone can confirm community reports" on public.report_confirmations;
+create policy "Anyone can confirm community reports"
+  on public.report_confirmations for insert
+  with check (
+    length(trim(confirmer_id)) > 0 and
+    exists (
+      select 1 from public.reports
+      where reports.id = report_id and reports.source = 'user'
+    )
+  );
+
+create or replace function public.increment_report_confirmation_count()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  update public.reports
+  set confirmation_count = confirmation_count + 1
+  where id = new.report_id;
+  return new;
+end;
+$$;
+
+drop trigger if exists report_confirmation_inserted on public.report_confirmations;
+create trigger report_confirmation_inserted
+  after insert on public.report_confirmations
+  for each row execute function public.increment_report_confirmation_count();
 ```
+
+Community reports are initially **Unconfirmed**. A report is shown as **Confirmed by N people** after three confirmations. Each browser installation can confirm each report once; this anonymous demo does not verify a person's identity. In local-storage mode, confirmations are only stored in that browser. Supabase is required to share confirmation counts across browsers.
 
 In the project folder, create `.env.local` and add the **CARTO Basemaps key** you received. Add the **Project URL** and **anon/public key** too if you are connecting Supabase:
 
