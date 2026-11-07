@@ -504,9 +504,17 @@ function NearbyMapController({
   reports: Report[]
 }) {
   const map = useMap()
+  const lastFitTarget = useRef<string | null>(null)
 
   useEffect(() => {
-    if (!active || !location) return
+    if (!active || !location) {
+      lastFitTarget.current = null
+      return
+    }
+
+    const fitTarget = `${location.latitude},${location.longitude}`
+    if (lastFitTarget.current === fitTarget) return
+    lastFitTarget.current = fitTarget
 
     if (reports.length > 0) {
       const bounds = latLngBounds([
@@ -589,7 +597,6 @@ function App() {
   const [typeFilter, setTypeFilter] = useState<IssueType | 'all'>('all')
   const [visibleIssueTypes, setVisibleIssueTypes] = useState<IssueType[]>(issueTypes)
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
-  const [, setShowMyReports] = useState(false)
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [dateFilter, setDateFilter] = useState<DateFilter>('last-90-days')
   const [customStartDate, setCustomStartDate] = useState('')
@@ -754,7 +761,6 @@ function App() {
     (typeFilter === 'all' || report.issue_type === typeFilter) &&
     visibleIssueTypes.includes(report.issue_type) &&
     (sourceFilter === 'all' || report.source === sourceFilter) &&
-    (statusFilter === 'all' || report.status === statusFilter) &&
     (dateFilter === 'all' ||
       (dateFilter === 'last-90-days' && Date.parse(report.created_at) >= Date.now() - LAST_90_DAYS_MS) ||
       (dateFilter === 'custom' && (
@@ -762,7 +768,7 @@ function App() {
         (!selectedCustomRangeError && isWithinCustomDateRange(report, customStartDate, customEndDate))
       ))) &&
     (!isNearMeActive || !nearMeLocation || distanceInKilometers(nearMeLocation, report) <= NEARBY_RADIUS_KM),
-  ), [reports, typeFilter, visibleIssueTypes, sourceFilter, statusFilter, dateFilter, customStartDate, customEndDate, selectedCustomRangeError, isNearMeActive, nearMeLocation])
+  ), [reports, typeFilter, visibleIssueTypes, sourceFilter, dateFilter, customStartDate, customEndDate, selectedCustomRangeError, isNearMeActive, nearMeLocation])
 
   const filteredReports = useMemo(() => summaryReports.filter((report) =>
     statusFilter === 'all' ||
@@ -849,6 +855,15 @@ function App() {
   }
 
   function handleMyReportSelect(reportId: string) {
+    const report = myReports.find((item) => item.id === reportId)
+    if (!report) return
+
+    setTypeFilter('all')
+    setVisibleIssueTypes((current) => current.includes(report.issue_type) ? current : [...current, report.issue_type])
+    setSourceFilter('all')
+    setStatusFilter('all')
+    setDateFilter('all')
+    setIsNearMeActive(false)
     setSelectedMyReportId(reportId)
     setMyReportsOpen(false)
   }
@@ -1134,7 +1149,6 @@ function App() {
                 <div className="select-wrap">
                   <select id="source-filter" value={sourceFilter} onChange={(event) => {
                     setSourceFilter(event.target.value as SourceFilter)
-                    setShowMyReports(false)
                   }}>
                     <option value="all">All sources</option>
                     <option value="user">Community</option>
@@ -1307,35 +1321,46 @@ function App() {
               {isPlacing ? <X size={15} /> : <Plus size={16} />}
               {isPlacing ? 'Cancel report' : 'Report an issue'}
             </button>
-            <button className="map-report-button my-reports-button" type="button" onClick={openMyReports}>
+            <button
+              className="top-report-button map-report-button"
+              type="button"
+              onClick={openMyReports}
+              aria-expanded={myReportsOpen}
+              aria-controls="my-reports-panel"
+            >
               <MapPin size={15} />
               My Reports
             </button>
           </div>
           {myReportsOpen && (
-            <div className="my-reports-panel">
+            <section id="my-reports-panel" className="my-reports-panel" aria-label="My reports">
               <div className="my-reports-header">
-                <span>MY REPORTS</span>
+                <h2>MY REPORTS</h2>
                 <button type="button" aria-label="Close My Reports" onClick={() => setMyReportsOpen(false)}><X size={15} /></button>
               </div>
-              {myReports.length === 0 ? (
-                <p className="my-reports-empty">No reports yet.</p>
+              {reportsLoading ? (
+                <p className="my-reports-empty">Loading your reports…</p>
+              ) : reportsError ? (
+                <p className="my-reports-empty" role="alert">{reportsError}</p>
+              ) : myReports.length === 0 ? (
+                <p className="my-reports-empty">No community reports yet. Use “Report an issue” to add your first.</p>
               ) : (
                 <ul className="my-reports-list">
                   {myReports.map((report) => (
                     <li key={report.id}>
                       <button type="button" className="my-report-item" onClick={() => handleMyReportSelect(report.id)}>
-                        <span className="my-report-item-main">
+                        <span className="my-report-item-heading">
                           <strong>{issueLabel(report.issue_type)}</strong>
-                          <small>{statusLabel(report.status)}</small>
+                          <small className={`my-report-status ${report.status === 'resolved' ? 'resolved' : 'open'}`}>{statusLabel(report.status)}</small>
                         </span>
-                        <span className="my-report-item-meta">{new Date(report.created_at).toLocaleDateString()}</span>
+                        <span className="my-report-item-description">{report.description}</span>
+                        <span className="my-report-item-date">{new Date(report.created_at).toLocaleDateString()}</span>
                       </button>
                     </li>
                   ))}
                 </ul>
               )}
-            </div>
+            </section>
           )}
           {reportPanelOpen && (
             <div ref={reportPanelRef} className="report-panel" style={{ left: reportPanelPosition.x, top: reportPanelPosition.y }}>

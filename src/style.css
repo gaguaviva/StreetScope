@@ -106,17 +106,83 @@ button { color: inherit; }
   box-shadow: 0 9px 20px rgba(36, 41, 33, 0.18);
   animation: report-button-slide 200ms ease-out;
 }
-.my-reports-button {
+.map-fab-stack .top-report-button { justify-content: center; min-width: 154px; }
+.my-reports-panel {
+  position: absolute;
+  top: 108px;
+  right: 18px;
+  z-index: 1201;
+  width: min(320px, calc(100% - 36px));
+  max-height: min(65vh, 480px);
+  overflow: hidden;
+  border: 1px solid #e6e9e1;
+  border-radius: 9px;
+  background: #fff;
+  box-shadow: 0 12px 30px rgba(36, 41, 33, 0.2);
+}
+.my-reports-header {
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 8px;
-  min-width: 132px;
-  border: 1px solid #dfe7d9;
-  background: #ffffff;
-  color: var(--deep-green);
+  justify-content: space-between;
+  min-height: 42px;
+  padding: 0 12px;
+  border-bottom: 1px solid #edf0e9;
+  background: #f8faf5;
 }
-.my-reports-button:hover { background: #f4f7f1; }
+.my-reports-header h2 {
+  margin: 0;
+  color: #51594f;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.085em;
+}
+.my-reports-header button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  color: #737b70;
+  background: transparent;
+  cursor: pointer;
+}
+.my-reports-header button:hover { color: #344a34; background: #edf2e8; }
+.my-reports-list {
+  display: grid;
+  max-height: calc(min(65vh, 480px) - 44px);
+  gap: 6px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 8px;
+  list-style: none;
+}
+.my-report-item {
+  display: grid;
+  width: 100%;
+  gap: 5px;
+  padding: 9px 10px;
+  border: 1px solid #e9ebe5;
+  border-radius: 5px;
+  background: #fff;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.my-report-item:hover, .my-report-item:focus-visible { border-color: #c7d5bf; background: #f7f9f4; }
+.my-report-item-heading { display: flex; align-items: center; gap: 8px; }
+.my-report-item-heading strong { color: #4a5347; font-size: 10px; font-weight: 600; }
+.my-report-item-heading .my-report-status { margin-left: auto; }
+.my-report-item-description {
+  overflow: hidden;
+  color: #737b70;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.my-report-item-date { color: #9a9f96; font-family: var(--mono); font-size: 8px; }
+.my-reports-empty { display: block; margin: 0; padding: 14px; color: #737b70; font-size: 10px; line-height: 1.5; }
 @keyframes report-button-slide {
   from { opacity: 0; transform: translateY(-10px); }
   to { opacity: 1; transform: translateY(0); }
