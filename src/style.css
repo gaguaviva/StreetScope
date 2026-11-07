@@ -693,6 +693,7 @@ h1 span { color: #778d6e; }
   .sidebar { order: 1; width: 100%; overflow: visible; padding: 23px 20px 20px; border-right: 0; }
   .sidebar-heading { padding-bottom: 19px; }
   h1 { font-size: 32px; }
+  .map-control { right: 13px; bottom: 33px; }
   .map-overlay-top { top: 12px; left: 12px; }
   .map-overlay-bottom { right: 8px; bottom: 8px; gap: 5px; font-size: 6px; }
   .map-controls { right: 13px; bottom: 33px; }
