@@ -60,6 +60,7 @@ const CITY_CACHE_KEY = 'sacramento-city-repair-cache'
 const CITY_CACHE_TTL_MS = 30 * 60 * 1000
 const LOCAL_STORAGE_KEY = 'sacramento-infrastructure-reports'
 const NEARBY_RADIUS_KM = 5
+const NEAR_DUPLICATE_RADIUS_KM = 1
 const LAST_90_DAYS_MS = 90 * 24 * 60 * 60 * 1000
 const issueTypes: IssueType[] = [
   'pothole',
@@ -615,9 +616,12 @@ function App() {
   const [severity, setSeverity] = useState<Severity>('medium')
   const [isSaving, setIsSaving] = useState(false)
   const [formError, setFormError] = useState('')
+  const [duplicateReport, setDuplicateReport] = useState<Report | null>(null)
   const [reportPanelOpen, setReportPanelOpen] = useState(false)
   const [reportPanelPosition, setReportPanelPosition] = useState({ x: 18, y: 78 })
   const [myReportsOpen, setMyReportsOpen] = useState(false)
+  const [reportPendingDeletion, setReportPendingDeletion] = useState<string | null>(null)
+  const [deleteReportError, setDeleteReportError] = useState('')
   const [selectedMyReportId, setSelectedMyReportId] = useState<string | null>(null)
   const reportPanelRef = useRef<HTMLDivElement | null>(null)
   const reportDragOffset = useRef<{ x: number; y: number } | null>(null)
@@ -839,6 +843,7 @@ function App() {
       return buildAutoDescription('pothole', preferredLocation, addressQuery.trim() || null)
     })
     setFormError('')
+    setDuplicateReport(null)
     setReportPanelOpen(false)
     setIsPlacing(true)
   }
@@ -848,6 +853,7 @@ function App() {
     setIsPlacing(false)
     setReportPanelOpen(false)
     setFormError('')
+    setDuplicateReport(null)
   }
 
   function openMyReports() {
@@ -866,6 +872,19 @@ function App() {
     setIsNearMeActive(false)
     setSelectedMyReportId(reportId)
     setMyReportsOpen(false)
+  }
+
+  function deleteLocalReport(reportId: string) {
+    try {
+      const nextReports = userReports.filter((report) => report.id !== reportId)
+      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(nextReports))
+      setUserReports(nextReports)
+      setSelectedMyReportId((current) => current === reportId ? null : current)
+      setReportPendingDeletion(null)
+      setDeleteReportError('')
+    } catch (error) {
+      setDeleteReportError(error instanceof Error ? `Could not delete report: ${error.message}` : 'Could not delete report.')
+    }
   }
 
   function handleReportPanelPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
@@ -896,6 +915,7 @@ function App() {
         setIsPlacing(false)
         setReportPanelOpen(true)
         setFormError('')
+        setDuplicateReport(null)
       })
       .catch((error: unknown) => setFormError(error instanceof Error ? error.message : 'Unable to get your location.'))
   }
@@ -954,6 +974,10 @@ function App() {
 
   async function submitReport(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    await processReportSubmission(false)
+  }
+
+  async function processReportSubmission(skipDuplicateCheck: boolean) {
     if (!draftLocation) {
       setFormError('Click the map to choose where the issue is located.')
       return
@@ -968,8 +992,6 @@ function App() {
       return
     }
 
-    setIsSaving(true)
-    setFormError('')
     const report: Report = {
       id: crypto.randomUUID(),
       ...draftLocation,
@@ -982,6 +1004,26 @@ function App() {
       address: formatReportLocation(draftLocation, addressQuery.trim() || null),
     }
 
+    if (!skipDuplicateCheck) {
+      const nearbyOpenReport = reports
+        .filter((candidate) => candidate.issue_type === issueType && candidate.status === 'open')
+        .map((candidate) => ({
+          report: candidate,
+          distance: distanceInKilometers(draftLocation, candidate),
+        }))
+        .filter(({ distance }) => distance <= NEAR_DUPLICATE_RADIUS_KM)
+        .sort((first, second) => first.distance - second.distance)[0]?.report
+
+      if (nearbyOpenReport) {
+        setDuplicateReport(nearbyOpenReport)
+        setFormError('')
+        return
+      }
+    }
+
+    setIsSaving(true)
+    setFormError('')
+    setDuplicateReport(null)
     try {
       let savedReport = report
       if (supabase) {
@@ -1030,6 +1072,30 @@ function App() {
     } finally {
       setIsSaving(false)
     }
+  }
+
+  function submitAsNewReport() {
+    void processReportSubmission(true)
+  }
+
+  function dismissDuplicateReport() {
+    cancelPlacing()
+  }
+
+  function renderDuplicateWarning() {
+    if (!duplicateReport || !draftLocation) return null
+
+    const distance = distanceInKilometers(draftLocation, duplicateReport)
+    return (
+      <div className="duplicate-warning" role="alert">
+        <p>Something similar was recently reported in this area, is this the same?</p>
+        <span>{issueLabel(duplicateReport.issue_type)} · {distance < 1 ? `${Math.round(distance * 1000)} m` : `${distance.toFixed(1)} km`} away · {new Date(duplicateReport.created_at).toLocaleDateString()}</span>
+        <div className="duplicate-actions">
+          <button type="button" onClick={dismissDuplicateReport}>Yes, don't submit another</button>
+          <button type="button" onClick={submitAsNewReport} disabled={isSaving}>No, submit a new report</button>
+        </div>
+      </div>
+    )
   }
 
   return (
@@ -1213,10 +1279,14 @@ function App() {
                   <button type="button" onClick={useMyLocation}><LocateFixed size={14} /> Use my location</button>
                 </div>
               )}
+              {renderDuplicateWarning()}
               <form className="report-form" onSubmit={(event) => void submitReport(event)}>
                 <label className="field-label" htmlFor="report-type">ISSUE TYPE</label>
                 <div className="select-wrap">
-                  <select id="report-type" value={issueType} onChange={(event) => setIssueType(event.target.value as IssueType)}>
+                  <select id="report-type" value={issueType} onChange={(event) => {
+                    setIssueType(event.target.value as IssueType)
+                    setDuplicateReport(null)
+                  }}>
                     {issueTypes.map((type) => <option value={type} key={type}>{issueLabel(type)}</option>)}
                   </select>
                   <ChevronDown size={15} />
@@ -1290,6 +1360,7 @@ function App() {
               const location = { latitude, longitude }
               setDraftLocation(location)
               setFormError('')
+              setDuplicateReport(null)
               setAddressQuery(await getLocationAddressLabel(location))
               setReportPanelOpen(true)
               setIsPlacing(false)
@@ -1348,18 +1419,47 @@ function App() {
                 <ul className="my-reports-list">
                   {myReports.map((report) => (
                     <li key={report.id}>
-                      <button type="button" className="my-report-item" onClick={() => handleMyReportSelect(report.id)}>
-                        <span className="my-report-item-heading">
-                          <strong>{issueLabel(report.issue_type)}</strong>
-                          <small className={`my-report-status ${report.status === 'resolved' ? 'resolved' : 'open'}`}>{statusLabel(report.status)}</small>
-                        </span>
-                        <span className="my-report-item-description">{report.description}</span>
-                        <span className="my-report-item-date">{new Date(report.created_at).toLocaleDateString()}</span>
-                      </button>
+                      <div className="my-report-entry">
+                        <button type="button" className="my-report-item" onClick={() => handleMyReportSelect(report.id)}>
+                          <span className="my-report-item-heading">
+                            <strong>{issueLabel(report.issue_type)}</strong>
+                            <small className={`my-report-status ${report.status === 'resolved' ? 'resolved' : 'open'}`}>{statusLabel(report.status)}</small>
+                          </span>
+                          <span className="my-report-item-description">{report.description}</span>
+                          <span className="my-report-item-date">{new Date(report.created_at).toLocaleDateString()}</span>
+                        </button>
+                        {!supabase && (
+                          reportPendingDeletion === report.id ? (
+                            <div className="delete-report-confirm" role="alertdialog" aria-label="Confirm report deletion">
+                              <p>Warning! This will permanently delete your report. Are you sure?</p>
+                              {deleteReportError && <p className="inline-error" role="alert">{deleteReportError}</p>}
+                              <div>
+                                <button type="button" onClick={() => deleteLocalReport(report.id)}>Yes</button>
+                                <button type="button" onClick={() => {
+                                  setReportPendingDeletion(null)
+                                  setDeleteReportError('')
+                                }}>No</button>
+                              </div>
+                            </div>
+                          ) : (
+                            <button
+                              className="delete-report-button"
+                              type="button"
+                              onClick={() => {
+                                setReportPendingDeletion(report.id)
+                                setDeleteReportError('')
+                              }}
+                            >
+                              Delete report
+                            </button>
+                          )
+                        )}
+                      </div>
                     </li>
                   ))}
                 </ul>
               )}
+              {supabase && <p className="my-reports-delete-note">Deleting shared reports is unavailable because report ownership is not set up.</p>}
             </section>
           )}
           {reportPanelOpen && (
@@ -1378,10 +1478,14 @@ function App() {
                     <button type="button" onClick={useMyLocation}><LocateFixed size={14} /> Use my location</button>
                   </div>
                 )}
+                {renderDuplicateWarning()}
                 <form className="report-form" onSubmit={(event) => void submitReport(event)}>
                   <label className="field-label" htmlFor="report-type">ISSUE TYPE</label>
                   <div className="select-wrap">
-                    <select id="report-type" value={issueType} onChange={(event) => setIssueType(event.target.value as IssueType)}>
+                    <select id="report-type" value={issueType} onChange={(event) => {
+                      setIssueType(event.target.value as IssueType)
+                      setDuplicateReport(null)
+                    }}>
                       {issueTypes.map((type) => <option value={type} key={type}>{issueLabel(type)}</option>)}
                     </select>
                     <ChevronDown size={15} />
@@ -1421,7 +1525,6 @@ function App() {
             </div>
           )}
           <div className="map-overlay map-overlay-top"><span className="map-area-dot" /> SACRAMENTO <span className="map-overlay-divider">/</span> CENTRAL CITY</div>
-          <div className="map-overlay map-overlay-bottom"><span>38°34'54.0"N&nbsp; 121°29'39.8"W</span><span className="map-overlay-divider">·</span><span>MAP DATA © OPENSTREETMAP</span></div>
           {isPlacing && !draftLocation && <div className="map-instruction"><ArrowDown size={15} /> Click the map to place your report</div>}
           {isPlacing && draftLocation && !reportPanelOpen && (
             <div className="map-instruction"><MapPin size={15} /> Location selected — complete the report below</div>
