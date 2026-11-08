@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import type { CSSProperties, FormEvent, PointerEvent as ReactPointerEvent } from 'react'
 import { CircleF, GoogleMap, InfoWindowF, useJsApiLoader } from '@react-google-maps/api'
 import type { Libraries } from '@react-google-maps/api'
 import { createClient } from '@supabase/supabase-js'
-import { AlertCircle, ArrowDown, ArrowUpRight, ChevronDown, Crosshair, Filter, LocateFixed, MapPin, Plus, Radio, Search, X } from 'lucide-react'
+import { AlertCircle, ArrowDown, ArrowUpRight, BarChart3, ChevronDown, Crosshair, Filter, LocateFixed, MapPin, Plus, Radio, Search, X, ZoomIn, ZoomOut } from 'lucide-react'
 import { appConfig } from './config'
 
 type IssueType =
@@ -48,6 +49,7 @@ interface Report {
   status: ReportStatus
   source: ReportSource
   created_at: string
+  resolved_at?: string | null
   address?: string
   external_id?: string | null
   confirmation_count?: number
@@ -69,6 +71,7 @@ interface ArcGisDateExtent {
 }
 
 const CITY_LAYER_URL = appConfig.cityLayerUrl
+const ARCHIVE_CITY_LAYER_URL = 'https://services5.arcgis.com/54falWtcpty3V47Z/ArcGIS/rest/services/SalesForce311_2020/FeatureServer'
 const LEGACY_CITY_LAYER_URL = appConfig.legacyCityLayerUrl
 const CITY_CACHE_KEY = 'sacramento-city-repair-cache'
 const CITY_CACHE_TTL_MS = 30 * 60 * 1000
@@ -320,6 +323,13 @@ function normalizeCityStatus(status: string | null | undefined): ReportStatus {
   return 'open'
 }
 
+function parseSourceDate(value: unknown) {
+  const numericValue = Number(value)
+  if (Number.isFinite(numericValue) && numericValue > 0) return new Date(numericValue).toISOString()
+  const parsedTime = Date.parse(String(value || ''))
+  return Number.isFinite(parsedTime) ? new Date(parsedTime).toISOString() : null
+}
+
 async function fetchCityLayer(layer: number, signal: AbortSignal): Promise<Report[]> {
   const query = new URLSearchParams({
     where: '1=1',
@@ -340,7 +350,7 @@ async function fetchCityLayer(layer: number, signal: AbortSignal): Promise<Repor
   return mapCityFeatures(collection, layer)
 }
 
-function mapCityFeatures(collection: ArcGisFeatureCollection, layer: number): Report[] {
+function mapCityFeatures(collection: ArcGisFeatureCollection, layer: number, idPrefix = 'city'): Report[] {
   return (collection.features || []).flatMap((feature) => {
     const position = coordinatesFor(feature)
     if (!position) return []
@@ -350,16 +360,16 @@ function mapCityFeatures(collection: ArcGisFeatureCollection, layer: number): Re
     const categoryLevel1 = typeof properties.CategoryLevel1 === 'string' ? properties.CategoryLevel1 : ''
     const issueType = normalizeCityIssueType(categoryName, categoryLevel1)
 
-    const dateCreated = Number(properties.DateCreated)
-    const date = Number.isFinite(dateCreated) && dateCreated > 0 ? new Date(dateCreated) : new Date()
+    const date = new Date(parseSourceDate(properties.DateCreated) || new Date().toISOString())
     const address = typeof properties.Address === 'string' ? properties.Address.trim() : ''
     const crossStreet = typeof properties.CrossStreet === 'string' ? properties.CrossStreet.trim() : ''
     const neighborhood = typeof properties.Neighborhood === 'string' ? properties.Neighborhood.trim() : ''
     const location = [address, crossStreet, neighborhood].filter(Boolean).join(' · ')
     const status = normalizeCityStatus(typeof properties.PublicStatus === 'string' ? properties.PublicStatus : null)
+    const resolvedAt = status === 'resolved' ? parseSourceDate(properties.DateUpdated) : null
 
     return [{
-      id: `city-${layer}-${String(properties.OBJECTID ?? feature.id ?? crypto.randomUUID())}`,
+      id: `${idPrefix}-${layer}-${String(properties.OBJECTID ?? feature.id ?? crypto.randomUUID())}`,
       external_id: String(properties.OBJECTID ?? feature.id ?? ''),
       issue_type: issueType,
       severity: 'medium' as const,
@@ -369,6 +379,7 @@ function mapCityFeatures(collection: ArcGisFeatureCollection, layer: number): Re
       status,
       source: 'city-of-sacramento' as const,
       created_at: date.toISOString(),
+      resolved_at: resolvedAt,
       address: location || undefined,
     }]
   })
@@ -401,6 +412,9 @@ async function fetchHistoricalCityReports(
   startDate: string,
   endDate: string,
   signal: AbortSignal,
+  sampleLarge = true,
+  layerUrl = CITY_LAYER_URL,
+  idPrefix = 'city',
 ): Promise<{ reports: Report[]; sampled: boolean }> {
   const endExclusive = new Date(Date.parse(`${endDate}T00:00:00.000Z`) + 24 * 60 * 60 * 1000)
     .toISOString()
@@ -411,7 +425,7 @@ async function fetchHistoricalCityReports(
     returnCountOnly: 'true',
     f: 'json',
   })
-  const countResponse = await fetch(`${CITY_LAYER_URL}/0/query?${countQuery}`, { signal })
+  const countResponse = await fetch(`${layerUrl}/0/query?${countQuery}`, { signal })
   if (!countResponse.ok) throw new Error(`Historical City count request failed (${countResponse.status}).`)
 
   const countResult = await countResponse.json() as { count?: number; error?: { message?: string } }
@@ -421,7 +435,7 @@ async function fetchHistoricalCityReports(
   }
   const totalCount = countResult.count
 
-  const sampled = totalCount > MAX_CUMULATIVE_REPORTS &&
+  const sampled = sampleLarge && totalCount > MAX_CUMULATIVE_REPORTS &&
     Date.parse(endDate) - Date.parse(startDate) >= 24 * 60 * 60 * 1000
   const pageSize = sampled ? CUMULATIVE_SAMPLE_PAGE_SIZE : CITY_PAGE_SIZE
   const pageCount = sampled
@@ -448,14 +462,14 @@ async function fetchHistoricalCityReports(
         orderByFields: 'DateCreated DESC, OBJECTID DESC',
         f: 'geojson',
       })
-      const response = await fetch(`${CITY_LAYER_URL}/0/query?${query}`, { signal })
+      const response = await fetch(`${layerUrl}/0/query?${query}`, { signal })
       if (!response.ok) throw new Error(`Historical City data request failed (${response.status}).`)
 
       const collection = await response.json() as ArcGisFeatureCollection
       if (collection.error) throw new Error(collection.error.message || 'Historical City data could not be loaded.')
       return collection
     }))
-    collections.forEach((collection) => reports.push(...mapCityFeatures(collection, 0)))
+    collections.forEach((collection) => reports.push(...mapCityFeatures(collection, 0, idPrefix)))
   }
 
   return { reports, sampled }
@@ -485,8 +499,7 @@ async function fetchLegacyCityLayer(layer: number, signal: AbortSignal): Promise
     const properties = feature.properties || {}
     const category = String(properties.CategoryName || (layer === 1 ? 'Pothole' : 'Street light')).toLowerCase()
     const issueType: IssueType = category.includes('pothole') ? 'pothole' : 'streetlight'
-    const dateCreated = Number(properties.DateCreated)
-    const date = Number.isFinite(dateCreated) && dateCreated > 0 ? new Date(dateCreated) : new Date()
+    const date = new Date(parseSourceDate(properties.DateCreated) || new Date().toISOString())
     const crossStreet = typeof properties.CrossStreet === 'string' ? properties.CrossStreet : ''
     const neighborhood = typeof properties.Neighborhood === 'string' ? properties.Neighborhood : ''
     const location = [crossStreet, neighborhood].filter(Boolean).join(' · ')
@@ -502,6 +515,69 @@ async function fetchLegacyCityLayer(layer: number, signal: AbortSignal): Promise
       status: 'resolved' as const,
       source: 'city-of-sacramento' as const,
       created_at: date.toISOString(),
+      resolved_at: date.toISOString(),
+      address: location || undefined,
+    }]
+  })
+}
+
+async function fetchHistoricalLegacyCityReports(startDate: string, endDate: string, signal: AbortSignal): Promise<Report[]> {
+  const endExclusive = new Date(Date.parse(`${endDate}T00:00:00.000Z`) + 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+  const where = `DateCreated >= TIMESTAMP '${startDate} 00:00:00' AND DateCreated < TIMESTAMP '${endExclusive} 00:00:00'`
+  const layers = [0, 1]
+  const reports: Report[] = []
+
+  for (const layer of layers) {
+    const countQuery = new URLSearchParams({ where, returnCountOnly: 'true', f: 'json' })
+    const countResponse = await fetch(`${LEGACY_CITY_LAYER_URL}/${layer}/query?${countQuery}`, { signal })
+    if (!countResponse.ok) continue
+    const countResult = await countResponse.json() as { count?: number; error?: { message?: string } }
+    if (countResult.error || !countResult.count) continue
+    const pageSize = 2000
+    for (let offset = 0; offset < countResult.count; offset += pageSize) {
+      const query = new URLSearchParams({
+        where,
+        outFields: 'OBJECTID,CategoryName,DateCreated,CrossStreet,Neighborhood',
+        returnGeometry: 'true',
+        outSR: '4326',
+        resultRecordCount: String(Math.min(pageSize, countResult.count - offset)),
+        resultOffset: String(offset),
+        orderByFields: 'DateCreated DESC, OBJECTID DESC',
+        f: 'geojson',
+      })
+      const response = await fetch(`${LEGACY_CITY_LAYER_URL}/${layer}/query?${query}`, { signal })
+      if (!response.ok) break
+      const collection = await response.json() as ArcGisFeatureCollection
+      if (collection.error) break
+      reports.push(...mapLegacyCityFeatures(collection, layer))
+    }
+  }
+  return reports
+}
+
+function mapLegacyCityFeatures(collection: ArcGisFeatureCollection, layer: number): Report[] {
+  return (collection.features || []).flatMap((feature) => {
+    const position = coordinatesFor(feature)
+    if (!position) return []
+    const properties = feature.properties || {}
+    const category = String(properties.CategoryName || (layer === 1 ? 'Pothole' : 'Street light')).toLowerCase()
+    const issueType: IssueType = category.includes('pothole') ? 'pothole' : 'streetlight'
+    const date = new Date(parseSourceDate(properties.DateCreated) || new Date().toISOString())
+    const crossStreet = typeof properties.CrossStreet === 'string' ? properties.CrossStreet : ''
+    const neighborhood = typeof properties.Neighborhood === 'string' ? properties.Neighborhood : ''
+    const location = [crossStreet, neighborhood].filter(Boolean).join(' · ')
+    return [{
+      id: `legacy-city-${layer}-${String(properties.OBJECTID ?? feature.id ?? crypto.randomUUID())}`,
+      external_id: String(properties.OBJECTID ?? feature.id ?? ''),
+      issue_type: issueType,
+      severity: 'medium' as const,
+      description: `${issueType === 'pothole' ? 'Pothole repair' : 'Street light repair'} recorded by the City${location ? ` near ${location}` : ''}.`,
+      latitude: position.latitude,
+      longitude: position.longitude,
+      status: 'resolved' as const,
+      source: 'city-of-sacramento' as const,
+      created_at: date.toISOString(),
+      resolved_at: date.toISOString(),
       address: location || undefined,
     }]
   })
@@ -809,9 +885,12 @@ function ReportAdvancedMarker({
               <span className="popup-dot" style={{ backgroundColor: color }} />
               <strong>{issueLabel(report.issue_type)}</strong>
               <span className="popup-time">{reportTime}</span>
-              <span className={`popup-status ${report.status}`}>{statusLabel(report.status)}</span>
+              <button className="popup-close-button" type="button" onClick={onClose} aria-label="Close report details"><X size={14} /></button>
             </div>
-            {report.status !== 'resolved' && <span className="popup-age">{reportAgeLabel(report)}</span>}
+            <div className="popup-subline">
+              <span className={`popup-status ${report.status}`}>{statusLabel(report.status)}</span>
+              {report.status !== 'resolved' && <span className="popup-age">{reportAgeLabel(report)}</span>}
+            </div>
             {report.source === 'user' && (
               <div className={`report-confirmation ${isConfirmed ? 'confirmed' : 'unconfirmed'}`}>
                 <span>{isConfirmed ? `Confirmed by ${confirmationCount} people` : `Unconfirmed · ${confirmationCount}/${CONFIRMATION_THRESHOLD} confirmations`}</span>
@@ -857,8 +936,9 @@ function LocationAdvancedMarker({
       if (!active) return
 
       const pin = new PinElement({
-        background: '#567052',
+        background: '#f5222d',
         borderColor: '#ffffff',
+        scale: 1.2,
         glyphColor: '#ffffff',
         glyphText: '•',
       })
@@ -1056,6 +1136,7 @@ function LoadedGoogleMap({
                   <div className="popup-topline">
                     <span className="popup-dot" style={{ backgroundColor: '#567052' }} />
                     <strong>{locationLabel || 'Your location'}</strong>
+                    <button className="popup-close-button" type="button" onClick={() => setLocationInfoOpen(false)} aria-label="Close location details"><X size={14} /></button>
                   </div>
                 </div>
               </InfoWindowF>
@@ -1093,6 +1174,153 @@ function LoadedGoogleMap({
         />
       )}
     </div>
+  )
+}
+
+type ChartMetric = 'reported' | 'resolved' | 'growth'
+
+function monthKey(date: Date) {
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`
+}
+
+function chartMonthLabel(key: string) {
+  const date = new Date(`${key}-01T12:00:00Z`)
+  return date.toLocaleDateString(undefined, { month: 'short', year: 'numeric', timeZone: 'UTC' })
+}
+
+function ChartWindowContent({ reports, onClose, onConfirm, isLoading, error }: { reports: Report[]; onClose: () => void; onConfirm: (startDate: string, endDate: string) => void; isLoading: boolean; error: string }) {
+  const today = new Date().toISOString().slice(0, 10)
+  const reportDateBounds = useMemo(() => {
+    const dates = reports
+      .flatMap((report) => [report.created_at, report.resolved_at || ''].map((date) => Date.parse(date)))
+      .filter((time) => Number.isFinite(time))
+      .sort((first, second) => first - second)
+    if (dates.length === 0) return null
+    return {
+      start: new Date(dates[0]).toISOString().slice(0, 10),
+      end: new Date(Math.min(dates[dates.length - 1], Date.now())).toISOString().slice(0, 10),
+    }
+  }, [reports])
+  const defaultStart = reportDateBounds?.start || new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+  const defaultEnd = reportDateBounds?.end || today
+  const [metric, setMetric] = useState<ChartMetric>('reported')
+  const [selectedIssue, setSelectedIssue] = useState<IssueType | 'all'>('all')
+  const [startDate, setStartDate] = useState(defaultStart)
+  const [endDate, setEndDate] = useState(defaultEnd)
+  const [chartZoom, setChartZoom] = useState(1)
+  const [rangeInitialized, setRangeInitialized] = useState(false)
+  const [isConfirmed, setIsConfirmed] = useState(false)
+
+  useEffect(() => {
+    if (rangeInitialized || !reportDateBounds) return
+    setStartDate(reportDateBounds.start)
+    setEndDate(reportDateBounds.end)
+    setRangeInitialized(true)
+  }, [rangeInitialized, reportDateBounds])
+
+  const chartData = useMemo(() => {
+    if (!isConfirmed) return []
+    const start = Date.parse(`${startDate}T00:00:00.000Z`)
+    const end = Date.parse(`${endDate}T23:59:59.999Z`)
+    const counts = new Map<string, number>()
+    reports.forEach((report) => {
+      const time = Date.parse(metric === 'resolved' ? (report.resolved_at || '') : report.created_at)
+      if (!Number.isFinite(time) || time < start || time > end) return
+      if (selectedIssue !== 'all' && report.issue_type !== selectedIssue) return
+      if (metric === 'resolved' && report.status !== 'resolved') return
+      const key = monthKey(new Date(time))
+      counts.set(key, (counts.get(key) || 0) + 1)
+    })
+    if (!startDate || !endDate || start > end) return []
+    const firstMonth = new Date(`${startDate.slice(0, 7)}-01T12:00:00Z`)
+    const lastMonth = new Date(`${endDate.slice(0, 7)}-01T12:00:00Z`)
+    const values: Array<{ label: string; value: number }> = []
+    for (const cursor = new Date(firstMonth); cursor <= lastMonth; cursor.setUTCMonth(cursor.getUTCMonth() + 1)) {
+      const key = monthKey(cursor)
+      const current = counts.get(key) || 0
+      const previous = counts.get(monthKey(new Date(Date.UTC(cursor.getUTCFullYear(), cursor.getUTCMonth() - 1, 1)))) || 0
+      values.push({ label: chartMonthLabel(key), value: metric === 'growth' ? current - previous : current })
+    }
+    return values
+  }, [endDate, isConfirmed, metric, reports, selectedIssue, startDate])
+
+  function changeFilter(setter: (value: string) => void, value: string) {
+    setter(value)
+    setIsConfirmed(false)
+  }
+
+  const maxValue = Math.max(1, ...chartData.map((point) => Math.abs(point.value)))
+  const total = chartData.reduce((sum, point) => sum + point.value, 0)
+  const width = Math.max(1100, chartData.length * 100)
+  const height = 460
+  const padding = { top: 24, right: 24, bottom: 54, left: 52 }
+  const plotWidth = width - padding.left - padding.right
+  const plotHeight = height - padding.top - padding.bottom
+  const zeroY = metric === 'growth' ? padding.top + plotHeight / 2 : padding.top + plotHeight
+  const points = chartData.map((point, index) => {
+    const x = chartData.length === 1 ? padding.left + plotWidth / 2 : padding.left + (index / (chartData.length - 1)) * plotWidth
+    const y = metric === 'growth'
+      ? zeroY - (point.value / maxValue) * (plotHeight / 2)
+      : padding.top + plotHeight - (point.value / maxValue) * plotHeight
+    return { ...point, x, y }
+  })
+  const line = points.map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x} ${point.y}`).join(' ')
+  const title = metric === 'reported' ? 'New reports per month' : metric === 'resolved' ? 'Resolved cases per month' : 'Month-over-month growth'
+
+  return (
+    <main className="chart-window">
+      <header className="chart-window-header">
+        <div>
+          <span className="chart-eyebrow"><BarChart3 size={14} /> DATA VISUALIZER</span>
+          <h1>Understand what’s changing</h1>
+          <p>Explore issue trends across the reports on StreetScope.</p>
+        </div>
+        <button className="chart-close-button" type="button" onClick={onClose} aria-label="Close data visualizer"><X size={18} /></button>
+      </header>
+      <section className="chart-filters" aria-label="Chart filters">
+        <label><span>MEASURE</span><select value={metric} onChange={(event) => changeFilter((value) => setMetric(value as ChartMetric), event.target.value)}><option value="reported">New reports</option><option value="resolved">Resolved cases</option><option value="growth">Growth vs prior month</option></select></label>
+        <label><span>ISSUE</span><select value={selectedIssue} onChange={(event) => changeFilter((value) => setSelectedIssue(value as IssueType | 'all'), event.target.value)}><option value="all">All issue types</option>{issueTypes.map((type) => <option value={type} key={type}>{issueLabel(type)}</option>)}</select></label>
+        <label><span>START DATE</span><input type="date" max={endDate} value={startDate} onChange={(event) => changeFilter(setStartDate, event.target.value)} /></label>
+        <label><span>END DATE</span><input type="date" min={startDate} max={today} value={endDate} onChange={(event) => changeFilter(setEndDate, event.target.value)} /></label>
+        <button className="chart-confirm-button" type="button" onClick={() => { setIsConfirmed(true); onConfirm(startDate, endDate) }} disabled={isLoading || !startDate || !endDate || startDate > endDate}>Confirm and load data</button>
+      </section>
+      <section className="chart-card">
+        <div className="chart-card-heading">
+          <div><span className="chart-eyebrow">TREND</span><h2>{title}</h2></div>
+          <div className="chart-heading-actions">
+            <div className="chart-zoom-controls" role="group" aria-label="Chart zoom">
+              <button type="button" onClick={() => setChartZoom((current) => Math.max(0.75, Number((current - 0.25).toFixed(2))))} disabled={chartZoom <= 0.75} aria-label="Zoom out"><ZoomOut size={15} /></button>
+              <span>{Math.round(chartZoom * 100)}%</span>
+              <button type="button" onClick={() => setChartZoom((current) => Math.min(2.5, Number((current + 0.25).toFixed(2))))} disabled={chartZoom >= 2.5} aria-label="Zoom in"><ZoomIn size={15} /></button>
+            </div>
+            <strong>{total > 0 && metric === 'growth' ? `+${total}` : total}</strong>
+          </div>
+        </div>
+        {isLoading ? <p className="chart-empty chart-loading"><span className="button-spinner" /> Loading historical records…</p> : error ? <p className="chart-empty" role="alert">{error}</p> : !isConfirmed ? <p className="chart-empty">Choose your filters, then click “Confirm and load data”.</p> : chartData.length === 0 ? <p className="chart-empty">No report activity for this selection.</p> : (
+          <div className="chart-svg-wrap">
+            <svg style={{ width: `${chartZoom * 100}%`, minWidth: `${chartZoom * width}px` }} viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${title} chart`}>
+              {[0, 0.25, 0.5, 0.75, 1].map((fraction) => {
+                const y = padding.top + plotHeight * fraction
+                const axisValue = metric === 'growth'
+                  ? Math.round(maxValue * (1 - fraction * 2))
+                  : Math.round(maxValue * (1 - fraction))
+                return (
+                  <g key={fraction}>
+                    <line x1={padding.left} x2={width - padding.right} y1={y} y2={y} className="chart-grid-line" />
+                    <text x={padding.left - 12} y={y + 4} textAnchor="end" className="chart-y-axis-label">{axisValue.toLocaleString()}</text>
+                  </g>
+                )
+              })}
+              <line x1={padding.left} x2={padding.left} y1={padding.top} y2={padding.top + plotHeight} className="chart-axis-line" />
+              {metric === 'growth' && <line x1={padding.left} x2={width - padding.right} y1={zeroY} y2={zeroY} className="chart-zero-line" />}
+              <path d={line} className="chart-line" />
+              {points.map((point) => <g key={point.label}><circle cx={point.x} cy={point.y} r="5" className="chart-point" /><text x={point.x} y={height - 18} textAnchor="middle" className="chart-axis-label">{point.label}</text></g>)}
+            </svg>
+          </div>
+        )}
+        <p className="chart-note">{isLoading ? 'Loading the full historical City dataset… ' : ''}{isConfirmed ? `Based on ${reports.length.toLocaleString()} loaded reports. ` : ''}Resolved cases use the City’s update date when available; growth is the change from the previous month.</p>
+      </section>
+    </main>
   )
 }
 
@@ -1144,8 +1372,88 @@ function App() {
   const [reportPendingDeletion, setReportPendingDeletion] = useState<string | null>(null)
   const [deleteReportError, setDeleteReportError] = useState('')
   const [selectedMyReportId, setSelectedMyReportId] = useState<string | null>(null)
+  const [visualizerOpen, setVisualizerOpen] = useState(false)
+  const [visualizerReports, setVisualizerReports] = useState<Report[]>([])
+  const [visualizerLoading, setVisualizerLoading] = useState(false)
+  const [visualizerError, setVisualizerError] = useState('')
+  const [chartWindowRoot, setChartWindowRoot] = useState<HTMLElement | null>(null)
   const reportPanelRef = useRef<HTMLDivElement | null>(null)
   const reportDragOffset = useRef<{ x: number; y: number } | null>(null)
+  const chartWindowRef = useRef<Window | null>(null)
+  const visualizerRequestRef = useRef<AbortController | null>(null)
+
+  useEffect(() => {
+    if (!visualizerOpen) {
+      chartWindowRef.current?.close()
+      chartWindowRef.current = null
+      setChartWindowRoot(null)
+      return
+    }
+
+    const chartWindow = window.open('', 'streetscope-data-visualizer', 'popup,width=1280,height=900')
+    if (!chartWindow) {
+      setVisualizerOpen(false)
+      return
+    }
+    chartWindowRef.current = chartWindow
+    chartWindow.document.title = 'StreetScope · Visualize Data'
+    chartWindow.document.body.innerHTML = '<div id="streetscope-chart-root"></div>'
+    const style = chartWindow.document.createElement('style')
+    style.textContent = `
+      :root { font-family: 'DM Sans', 'Segoe UI', sans-serif; color: #252c27; background: #f7f7f3; }
+      * { box-sizing: border-box; } body { margin: 0; min-width: 680px; } button, select, input { font: inherit; }
+      .chart-window { max-width: 1320px; margin: 0 auto; padding: 42px 48px 54px; }
+      .chart-window-header { display:flex; justify-content:space-between; gap:24px; margin-bottom:30px; }
+      .chart-eyebrow { display:inline-flex; align-items:center; gap:7px; color:#78906f; font:500 10px 'DM Mono', monospace; letter-spacing:.12em; }
+      .chart-window h1 { margin:10px 0 7px; font:700 30px Manrope, sans-serif; letter-spacing:-.04em; }
+      .chart-window-header p { margin:0; color:#7e867b; font-size:13px; }
+      .chart-close-button { width:36px; height:36px; display:grid; place-items:center; border:1px solid #e1e5dc; border-radius:6px; background:#fff; color:#677363; cursor:pointer; }
+      .chart-filters { display:grid; grid-template-columns:1.2fr 1.2fr 1fr 1fr; gap:14px; padding:18px; border:1px solid #e3e7df; border-radius:9px; background:#fff; }
+      .chart-filters label { display:grid; gap:7px; }
+      .chart-filters label > span { color:#838b80; font:500 9px 'DM Mono', monospace; letter-spacing:.1em; }
+      .chart-filters select, .chart-filters input { width:100%; height:38px; border:1px solid #e1e6de; border-radius:5px; padding:0 10px; background:#fbfcf9; color:#465143; font-size:12px; }
+      .chart-confirm-button { grid-column:1 / -1; justify-self:end; border:0; border-radius:5px; padding:10px 16px; background:#304331; color:#fff; cursor:pointer; font-size:12px; font-weight:600; }
+      .chart-confirm-button:hover:not(:disabled) { background:#496447; }
+      .chart-confirm-button:disabled { opacity:.6; cursor:not-allowed; }
+      .chart-card { margin-top:20px; padding:24px 24px 18px; border:1px solid #e3e7df; border-radius:9px; background:#fff; }
+      .chart-card-heading { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; }
+      .chart-heading-actions { display:flex; align-items:center; gap:18px; }
+      .chart-zoom-controls { display:flex; align-items:center; gap:6px; border:1px solid #e1e6de; border-radius:5px; padding:3px; color:#788376; font:500 10px 'DM Mono', monospace; }
+      .chart-zoom-controls button { width:28px; height:27px; display:grid; place-items:center; border:0; border-radius:3px; background:transparent; color:#567052; cursor:pointer; }
+      .chart-zoom-controls button:hover:not(:disabled) { background:#eef3eb; }
+      .chart-zoom-controls button:disabled { color:#bec6ba; cursor:not-allowed; }
+      .chart-zoom-controls span { min-width:36px; text-align:center; }
+      .chart-card h2 { margin:7px 0 0; color:#364135; font:600 20px Manrope, sans-serif; }
+      .chart-card-heading strong { color:#567052; font:700 28px Manrope, sans-serif; }
+      .chart-svg-wrap { height:500px; margin-top:22px; overflow:auto; border-top:1px solid #f0f2ed; border-bottom:1px solid #f0f2ed; padding:14px 0; }
+      .chart-svg-wrap svg { display:block; min-width:900px; width:100%; height:460px; }
+      .chart-grid-line { stroke:#edf0e9; stroke-width:1; } .chart-axis-line { stroke:#b9c6b4; stroke-width:1.5; } .chart-zero-line { stroke:#cbd7c5; stroke-dasharray:5 5; }
+      .chart-line { fill:none; stroke:#567052; stroke-width:4; stroke-linecap:round; stroke-linejoin:round; }
+      .chart-point { fill:#fff; stroke:#567052; stroke-width:3; }
+      .chart-axis-label, .chart-y-axis-label { fill:#8b9488; font:10px 'DM Mono', monospace; }
+      .chart-y-axis-label { fill:#697565; }
+      .chart-note, .chart-empty { margin:6px 0 0; color:#969e93; font-size:11px; }
+      .chart-empty { min-height:260px; display:grid; place-items:center; border:1px dashed #dfe5db; margin-top:22px; }
+      .chart-loading { display:flex; flex-direction:column; gap:12px; }
+      .button-spinner { width:16px; height:16px; border:2px solid #b7c8ae; border-top-color:transparent; border-radius:50%; animation:spin .7s linear infinite; }
+      @keyframes spin { to { transform:rotate(360deg); } }
+      @media (max-width: 760px) { .chart-window { padding:28px 24px 40px; } .chart-filters { grid-template-columns:1fr 1fr; } }
+    `
+    chartWindow.document.head.appendChild(style)
+    const root = chartWindow.document.getElementById('streetscope-chart-root')
+    setChartWindowRoot(root)
+    const handleClosed = () => {
+      if (chartWindow.closed) setVisualizerOpen(false)
+    }
+    const closePoll = window.setInterval(handleClosed, 500)
+    chartWindow.focus()
+    return () => {
+      window.clearInterval(closePoll)
+      chartWindow.close()
+      chartWindowRef.current = null
+      setChartWindowRoot(null)
+    }
+  }, [visualizerOpen])
 
   useEffect(() => {
     try {
@@ -1301,6 +1609,68 @@ function App() {
     }
     return [...reportsById.values()]
   }, [userReports, cityReports, historicalCityReports])
+
+  async function loadVisualizerData(startDate: string, endDate: string) {
+    visualizerRequestRef.current?.abort()
+    const controller = new AbortController()
+    visualizerRequestRef.current = controller
+    setVisualizerLoading(true)
+    setVisualizerError('')
+
+    try {
+      const requests: Array<Promise<{ reports: Report[]; sampled: boolean } | Report[]>> = []
+      let archiveRequestIndex = -1
+      if (endDate >= '2024-01-01') {
+        requests.push(fetchHistoricalCityReports(
+          startDate > '2024-01-01' ? startDate : '2024-01-01',
+          endDate,
+          controller.signal,
+          true,
+        ))
+      }
+      if (startDate <= '2023-12-31' && endDate >= '2020-01-01') {
+        archiveRequestIndex = requests.length
+        requests.push(fetchHistoricalCityReports(
+          startDate > '2020-01-01' ? startDate : '2020-01-01',
+          endDate < '2023-12-31' ? endDate : '2023-12-31',
+          controller.signal,
+          false,
+          ARCHIVE_CITY_LAYER_URL,
+          'archive-city',
+        ))
+      }
+      if (startDate < '2020-01-01') {
+        requests.push(fetchHistoricalLegacyCityReports(startDate, endDate < '2019-12-31' ? endDate : '2019-12-31', controller.signal))
+      }
+      const results = await Promise.allSettled(requests)
+      const failedSources = results.filter((result) => result.status === 'rejected').length
+      const historicalReports = results.flatMap((result) => {
+        if (result.status === 'rejected') return []
+        return 'reports' in result.value ? result.value.reports : result.value
+      })
+      const archiveResult = archiveRequestIndex >= 0 ? results[archiveRequestIndex] : undefined
+      const archiveReports = archiveResult?.status === 'fulfilled' && 'reports' in archiveResult.value ? archiveResult.value.reports : []
+      if (archiveReports.length === 0 && startDate <= '2020-12-31' && endDate >= '2020-01-01') {
+        const fallbackReports = await fetchHistoricalLegacyCityReports(
+          startDate < '2020-01-01' ? '2020-01-01' : startDate,
+          endDate > '2020-12-31' ? '2020-12-31' : endDate,
+          controller.signal,
+        )
+        historicalReports.push(...fallbackReports)
+      }
+      setVisualizerReports((currentReports) => {
+        const reportsById = new Map<string, Report>()
+        for (const report of [...currentReports, ...historicalReports]) reportsById.set(report.id, report)
+        return [...reportsById.values()]
+      })
+      if (failedSources === results.length) {
+        setVisualizerError('Historical data could not be loaded. Check your connection and try confirming again.')
+      }
+    } finally {
+      if (!controller.signal.aborted) setVisualizerLoading(false)
+    }
+  }
+
   const timelineDayCount = daysBetweenDates(timelineStartDate, timelineEndDate)
   const selectedTimelineOffset = Math.min(
     timelineDayCount,
@@ -2115,6 +2485,26 @@ function App() {
             confirmationSetupError={confirmationSetupError}
             onConfirm={(report) => void confirmReport(report)}
           />
+          <button
+            className="visualize-data-button"
+            type="button"
+            onClick={() => {
+              const chartWindow = window.open('', 'streetscope-data-visualizer', 'popup,width=1280,height=900')
+              if (!chartWindow) {
+                window.alert('Your browser blocked the data visualizer window. Please allow pop-ups for StreetScope and try again.')
+                return
+              }
+              chartWindow.focus()
+              setVisualizerReports(reports)
+              setVisualizerLoading(false)
+              setVisualizerError('')
+              setVisualizerOpen(true)
+            }}
+            aria-label="Visualize data"
+          >
+            <BarChart3 size={15} />
+            Visualize data
+          </button>
           <div className="map-fab-stack">
             <button className={`top-report-button map-report-button ${isPlacing ? 'active' : ''}`} onClick={isPlacing ? cancelPlacing : startPlacing} type="button" aria-label={isPlacing ? 'Cancel report' : 'Report an issue'}>
               {isPlacing ? <X size={15} /> : <Plus size={16} />}
@@ -2257,7 +2647,6 @@ function App() {
               </div>
             </div>
           )}
-          <div className="map-overlay map-overlay-top"><span className="map-area-dot" /> SACRAMENTO <span className="map-overlay-divider">/</span> CENTRAL CITY</div>
           {isPlacing && !draftLocation && <div className="map-instruction"><ArrowDown size={15} /> Click the map to place your report</div>}
           {isPlacing && draftLocation && !reportPanelOpen && (
             <div className="map-instruction"><MapPin size={15} /> Location selected — complete the report below</div>
@@ -2269,6 +2658,7 @@ function App() {
           {filteredReports.length === 0 && !cityLoading && !isLoading && !cityError && (
             <div className="empty-map"><MapPin size={18} /><strong>Nothing to show here</strong><span>Try adjusting your filters or add a report.</span></div>
           )}
+          {chartWindowRoot && createPortal(<ChartWindowContent reports={visualizerReports.length ? visualizerReports : reports} isLoading={visualizerLoading} error={visualizerError} onConfirm={(startDate, endDate) => void loadVisualizerData(startDate, endDate)} onClose={() => setVisualizerOpen(false)} />, chartWindowRoot)}
         </section>
       </main>
     </div>
