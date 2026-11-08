@@ -6,20 +6,7 @@ import { createClient } from '@supabase/supabase-js'
 import { AlertCircle, ArrowDown, ArrowUpRight, ChevronDown, Crosshair, Filter, LocateFixed, MapPin, Plus, Radio, Search, X } from 'lucide-react'
 import { appConfig } from './config'
 
-type IssueType =
-  | 'pothole'
-  | 'streetlight'
-  | 'construction'
-  | 'sidewalk'
-  | 'trash'
-  | 'drainage'
-  | 'water'
-  | 'sewer'
-  | 'animal'
-  | 'parking'
-  | 'park'
-  | 'homeless'
-  | 'other'
+type IssueType = 'pothole' | 'streetlight' | 'construction' | 'sidewalk'
 type Severity = 'low' | 'medium' | 'high'
 type ReportStatus = 'open' | 'in-progress' | 'resolved'
 type ReportSource = 'user' | 'city-of-sacramento'
@@ -71,35 +58,44 @@ const CONFIRMER_ID_KEY = 'sacramento-infrastructure-confirmer-id'
 const CONFIRMATION_THRESHOLD = 3
 const NEARBY_RADIUS_KM = 5
 const NEAR_DUPLICATE_RADIUS_KM = 1
-const issueTypes: IssueType[] = [
-  'pothole',
-  'streetlight',
-  'construction',
-  'sidewalk',
-  'trash',
-  'drainage',
-  'water',
-  'sewer',
-  'animal',
-  'parking',
-  'park',
-  'homeless',
-  'other',
-]
+const DEFAULT_TIMELINE_DAYS = 30
+const DEFAULT_STATUS_FILTER: StatusFilter = 'needs-attention'
+const issueTypes: IssueType[] = ['pothole', 'streetlight', 'construction', 'sidewalk']
 const issueColors: Record<IssueType, string> = {
   pothole: '#ef8257',
   streetlight: '#e5ad4e',
   construction: '#6187d9',
   sidewalk: '#4ca98b',
-  trash: '#6c8b4d',
-  drainage: '#62a6c4',
-  water: '#4b7ad6',
-  sewer: '#7d5db0',
-  animal: '#c46d6d',
-  parking: '#d0a24d',
-  park: '#3c8f67',
-  homeless: '#8d5d44',
-  other: '#7d8597',
+}
+
+// Exact City of Sacramento 311 CategoryName values we show, mapped to our issue types.
+// This is an allowlist: it drives both the ArcGIS `where` clause (so nothing else is
+// downloaded) and the client-side mapping. Keyword matching is deliberately avoided —
+// e.g. "Homeless Encampment Blocking Sidewalk" must never be classified as a sidewalk issue.
+// The 311 layer has no dedicated construction category, so "construction" collects the
+// remaining street/right-of-way work that affects people walking and biking.
+const CITY_CATEGORY_ISSUE_TYPES: Record<string, IssueType> = {
+  'Streets Pothole': 'pothole',
+  'Streets Street Maintenance': 'pothole',
+  'Streets Street Lighting': 'streetlight',
+  'Streets Relamp': 'streetlight',
+  'Streets Sidewalk': 'sidewalk',
+  'Streets Curb/Gutter': 'sidewalk',
+  'Streets General': 'construction',
+  'Streets Streetscapes': 'construction',
+  'Streets Signs and Markings': 'construction',
+  'Streets Traffic Signals': 'construction',
+  'Streets Traffic Investigation': 'construction',
+  'Streets Bikeway Issues': 'construction',
+  'Streets Bike Rack Issues': 'construction',
+  'Streets Alley Gate': 'construction',
+}
+const CITY_CATEGORY_WHERE = `CategoryName IN (${Object.keys(CITY_CATEGORY_ISSUE_TYPES)
+  .map((name) => `'${name.replace(/'/g, "''")}'`)
+  .join(', ')})`
+
+function isIssueType(value: unknown): value is IssueType {
+  return typeof value === 'string' && (issueTypes as string[]).includes(value)
 }
 
 const supabaseUrl = appConfig.supabaseUrl
@@ -128,15 +124,6 @@ function issueLabel(issueType: IssueType) {
     streetlight: 'Street light',
     construction: 'Construction',
     sidewalk: 'Sidewalk',
-    trash: 'Trash / solid waste',
-    drainage: 'Drainage',
-    water: 'Water',
-    sewer: 'Sewer',
-    animal: 'Animal control',
-    parking: 'Parking',
-    park: 'Parks / public space',
-    homeless: 'Homeless encampment',
-    other: 'Other',
   }[issueType]
 }
 
@@ -221,6 +208,10 @@ function isWithinDateRange(report: Report, startDate: string, endDate: string) {
   return reportTime >= rangeStart && reportTime < rangeEndExclusive
 }
 
+function getDefaultTimelineStartDate() {
+  return new Date(Date.now() - DEFAULT_TIMELINE_DAYS * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+}
+
 function createTimelineDates(reports: Report[], cityStartDate: string | null) {
   const now = new Date()
   const today = now.toISOString().slice(0, 10)
@@ -251,7 +242,11 @@ function createTimelineDates(reports: Report[], cityStartDate: string | null) {
   }
 
   if (!dates.includes(today)) dates.push(today)
-  return dates
+  // Add the default start as its own stop so the initial range is exactly the last
+  // DEFAULT_TIMELINE_DAYS days instead of snapping back to the previous 1st/15th.
+  const defaultStartDate = getDefaultTimelineStartDate()
+  if (defaultStartDate > firstDate && !dates.includes(defaultStartDate)) dates.push(defaultStartDate)
+  return dates.sort()
 }
 
 function formatTimelineDate(date: string) {
@@ -297,26 +292,8 @@ async function getLocationAddressLabel(location: Coordinates): Promise<string> {
   return `${location.latitude.toFixed(5)}, ${location.longitude.toFixed(5)}`
 }
 
-function normalizeCityIssueType(categoryName: string, categoryLevel1?: string): IssueType {
-  const combined = `${categoryName || ''} ${categoryLevel1 || ''}`.toLowerCase()
-
-  if (combined.includes('pothole')) return 'pothole'
-  if (combined.includes('street light') || combined.includes('street lighting') || combined.includes('streetlight')) return 'streetlight'
-  if (combined.includes('sidewalk') || combined.includes('curb')) return 'sidewalk'
-  if (combined.includes('construction') || combined.includes('roadwork') || combined.includes('road work')) return 'construction'
-  if (combined.includes('street') && (combined.includes('repair') || combined.includes('maintenance'))) return 'pothole'
-  if (combined.includes('drain') || combined.includes('stormwater') || combined.includes('ditch')) return 'drainage'
-  if (combined.includes('sewer') || combined.includes('sanitary')) return 'sewer'
-  if (combined.includes('water') || combined.includes('hydrant') || combined.includes('utility')) return 'water'
-  if (combined.includes('trash') || combined.includes('dumping') || combined.includes('solid waste') || combined.includes('litter') || combined.includes('garbage')) return 'trash'
-  if (combined.includes('animal') || combined.includes('pet')) return 'animal'
-  if (combined.includes('parking') || combined.includes('parked') || combined.includes('parking meter')) return 'parking'
-  if (combined.includes('park') || combined.includes('ranger') || combined.includes('playground') || combined.includes('tree')) return 'park'
-  if (combined.includes('homeless') || combined.includes('encampment')) return 'homeless'
-  if (combined.includes('street') || combined.includes('road') || combined.includes('sign') || combined.includes('traffic')) return 'construction'
-  if (combined.includes('facility') || combined.includes('building') || combined.includes('permit') || combined.includes('planning')) return 'other'
-
-  return 'other'
+function normalizeCityIssueType(categoryName: string): IssueType | null {
+  return Object.hasOwn(CITY_CATEGORY_ISSUE_TYPES, categoryName) ? CITY_CATEGORY_ISSUE_TYPES[categoryName] : null
 }
 
 function normalizeCityStatus(status: string | null | undefined): ReportStatus {
@@ -328,7 +305,7 @@ function normalizeCityStatus(status: string | null | undefined): ReportStatus {
 
 async function fetchCityLayer(layer: number, signal: AbortSignal): Promise<Report[]> {
   const query = new URLSearchParams({
-    where: '1=1',
+    where: CITY_CATEGORY_WHERE,
     outFields: 'OBJECTID,CategoryName,CategoryLevel1,CategoryLevel2,PublicStatus,DateCreated,DateUpdated,Address,CrossStreet,Neighborhood',
     returnGeometry: 'true',
     outSR: '4326',
@@ -353,8 +330,8 @@ function mapCityFeatures(collection: ArcGisFeatureCollection, layer: number): Re
 
     const properties = feature.properties || {}
     const categoryName = String(properties.CategoryName || '').trim()
-    const categoryLevel1 = typeof properties.CategoryLevel1 === 'string' ? properties.CategoryLevel1 : ''
-    const issueType = normalizeCityIssueType(categoryName, categoryLevel1)
+    const issueType = normalizeCityIssueType(categoryName)
+    if (!issueType) return []
 
     const dateCreated = Number(properties.DateCreated)
     const date = Number.isFinite(dateCreated) && dateCreated > 0 ? new Date(dateCreated) : new Date()
@@ -382,7 +359,7 @@ function mapCityFeatures(collection: ArcGisFeatureCollection, layer: number): Re
 
 async function fetchCityTimelineStart(signal: AbortSignal): Promise<string> {
   const query = new URLSearchParams({
-    where: '1=1',
+    where: CITY_CATEGORY_WHERE,
     outStatistics: JSON.stringify([{
       statisticType: 'min',
       onStatisticField: 'DateCreated',
@@ -407,7 +384,7 @@ async function fetchHistoricalCityReports(startDate: string, endDate: string, si
   const endExclusive = new Date(Date.parse(`${endDate}T00:00:00.000Z`) + 24 * 60 * 60 * 1000)
     .toISOString()
     .slice(0, 10)
-  const where = `DateCreated >= TIMESTAMP '${startDate} 00:00:00' AND DateCreated < TIMESTAMP '${endExclusive} 00:00:00' AND (PublicStatus IS NULL OR UPPER(PublicStatus) <> 'CLOSED')`
+  const where = `DateCreated >= TIMESTAMP '${startDate} 00:00:00' AND DateCreated < TIMESTAMP '${endExclusive} 00:00:00' AND (PublicStatus IS NULL OR UPPER(PublicStatus) <> 'CLOSED') AND ${CITY_CATEGORY_WHERE}`
   const reports: Report[] = []
   let resultOffset = 0
 
@@ -503,7 +480,7 @@ function getCachedCityReports() {
       Date.now() - cached.savedAt < CITY_CACHE_TTL_MS &&
       'reports' in cached &&
       isReportArray(cached.reports) &&
-      cached.reports.every((report) => report.source === 'city-of-sacramento')
+      cached.reports.every((report) => report.source === 'city-of-sacramento' && isIssueType(report.issue_type))
     ) {
       return cached.reports
     }
@@ -837,7 +814,7 @@ function App() {
   const [typeFilter, setTypeFilter] = useState<IssueType | 'all'>('all')
   const [visibleIssueTypes, setVisibleIssueTypes] = useState<IssueType[]>(issueTypes)
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>(DEFAULT_STATUS_FILTER)
   const [timelineRange, setTimelineRange] = useState<{ start: number; end: number } | null>(null)
   const [deviceLocation, setDeviceLocation] = useState<Coordinates | null>(null)
   const [nearMeLocation, setNearMeLocation] = useState<Coordinates | null>(null)
@@ -974,11 +951,12 @@ function App() {
             .from('reports')
             .select('id, issue_type, description, severity, latitude, longitude, status, source, created_at, external_id, confirmation_count')
             .eq('source', 'user')
+            .in('issue_type', issueTypes)
             .order('created_at', { ascending: false })
             .limit(1000)
           if (error) throw new Error(`Could not load saved reports: ${error.message}`)
           if (active) {
-            setUserReports((data || []).map((row) => ({
+            setUserReports((data || []).filter((row) => isIssueType(row.issue_type)).map((row) => ({
               id: row.id,
               issue_type: row.issue_type as IssueType,
               description: row.description,
@@ -995,7 +973,7 @@ function App() {
         } else {
           const savedReports: unknown = JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEY) || '[]')
           if (!isReportArray(savedReports)) throw new Error('Saved reports have an unexpected format. Clear the browser storage and try again.')
-          if (active) setUserReports(savedReports.map((report) => ({
+          if (active) setUserReports(savedReports.filter((report) => isIssueType(report.issue_type)).map((report) => ({
             ...report,
             confirmation_count: report.confirmation_count ?? 0,
           })))
@@ -1020,7 +998,7 @@ function App() {
   }, [userReports, cityReports, historicalCityReports])
   const timelineDates = useMemo(() => createTimelineDates(userReports, cityStartDate), [userReports, cityStartDate])
   const timelineEndIndex = timelineDates.length - 1
-  const defaultTimelineStartDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+  const defaultTimelineStartDate = getDefaultTimelineStartDate()
   let defaultTimelineStartIndex = 0
   for (let index = 0; index < timelineDates.length; index += 1) {
     if (timelineDates[index] > defaultTimelineStartDate) break
@@ -1088,6 +1066,8 @@ function App() {
     [myReports, selectedMyReportId],
   )
 
+  // Single source for the "ON THE MAP" stat and the sidebar footer so they always agree.
+  const onTheMapCount = summaryReports.length
   const openCount = summaryReports.filter((report) => report.status !== 'resolved').length
   const resolvedCount = summaryReports.length - openCount
   const isLoading = cityLoading || reportsLoading
@@ -1505,7 +1485,7 @@ function App() {
           <section className="stats-grid" aria-label="Report statistics">
             <button type="button" className={`stat-card stat-total ${statusFilter === 'all' ? 'active' : ''}`} onClick={() => toggleStatusFilter('all')}>
               <span className="stat-label">ON THE MAP</span>
-              <strong>{isLoading ? '—' : summaryReports.length.toLocaleString()}</strong>
+              <strong>{isLoading ? '—' : onTheMapCount.toLocaleString()}</strong>
               <span className="stat-caption">total reports</span>
             </button>
             <button type="button" className={`stat-card ${statusFilter === 'needs-attention' ? 'active' : ''}`} onClick={() => toggleStatusFilter('needs-attention')}>
@@ -1748,7 +1728,7 @@ function App() {
             <p>The prototype aggregates public government infrastructure data and combines it with community-submitted reports.</p>
             {cityError && <p className="data-error" role="alert">{cityError}</p>}
             {reportsError && <p className="data-error" role="alert">{reportsError}</p>}
-            {cityReports.length > 0 && <span className="last-updated"><Radio size={11} /> {cityReports.length} public repair records loaded</span>}
+            {!isLoading && <span className="last-updated"><Radio size={11} /> {onTheMapCount.toLocaleString()} {onTheMapCount === 1 ? 'report' : 'reports'} on the map</span>}
           </div>
         </aside>
 
