@@ -862,29 +862,6 @@ function App() {
   }, [isPlacing])
 
   useEffect(() => {
-    let active = true
-    setIsLocating(true)
-    setNearMeError('')
-
-    void getCurrentPosition()
-      .then((location) => {
-        if (active) {
-          setDeviceLocation(location)
-          setNearMeLocation(location)
-          setIsNearMeActive(true)
-        }
-      })
-      .catch((error: unknown) => {
-        if (active) setNearMeError(error instanceof Error ? error.message : 'Unable to get your location.')
-      })
-      .finally(() => {
-        if (active) setIsLocating(false)
-      })
-
-    return () => { active = false }
-  }, [])
-
-  useEffect(() => {
     if (!draftLocation) return
     setDescription((current) => {
       const trimmed = current.trim()
@@ -1944,7 +1921,6 @@ function App() {
               </div>
             </div>
           )}
-          <div className="map-overlay map-overlay-top"><span className="map-area-dot" /> SACRAMENTO <span className="map-overlay-divider">/</span> CENTRAL CITY</div>
           {isPlacing && !draftLocation && <div className="map-instruction"><ArrowDown size={15} /> Click the map to place your report</div>}
           {isPlacing && draftLocation && !reportPanelOpen && (
             <div className="map-instruction"><MapPin size={15} /> Location selected — complete the report below</div>
