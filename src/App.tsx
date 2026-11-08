@@ -6,20 +6,7 @@ import { createClient } from '@supabase/supabase-js'
 import { AlertCircle, ArrowDown, ArrowUpRight, ChevronDown, Crosshair, Filter, LocateFixed, MapPin, Plus, Radio, Search, X } from 'lucide-react'
 import { appConfig } from './config'
 
-type IssueType =
-  | 'pothole'
-  | 'streetlight'
-  | 'construction'
-  | 'sidewalk'
-  | 'trash'
-  | 'drainage'
-  | 'water'
-  | 'sewer'
-  | 'animal'
-  | 'parking'
-  | 'park'
-  | 'homeless'
-  | 'other'
+type IssueType = 'pothole' | 'streetlight' | 'construction' | 'sidewalk'
 type Severity = 'low' | 'medium' | 'high'
 type ReportStatus = 'open' | 'in-progress' | 'resolved'
 type ReportSource = 'user' | 'city-of-sacramento'
@@ -61,8 +48,7 @@ interface ArcGisDateExtent {
 }
 
 const CITY_LAYER_URL = appConfig.cityLayerUrl
-const LEGACY_CITY_LAYER_URL = appConfig.legacyCityLayerUrl
-const CITY_CACHE_KEY = 'sacramento-city-repair-cache'
+const CITY_CACHE_KEY = 'sacramento-city-311-cache-v2'
 const CITY_CACHE_TTL_MS = 30 * 60 * 1000
 const CITY_PAGE_SIZE = 2000
 const LOCAL_STORAGE_KEY = 'sacramento-infrastructure-reports'
@@ -71,35 +57,44 @@ const CONFIRMER_ID_KEY = 'sacramento-infrastructure-confirmer-id'
 const CONFIRMATION_THRESHOLD = 3
 const NEARBY_RADIUS_KM = 5
 const NEAR_DUPLICATE_RADIUS_KM = 1
-const issueTypes: IssueType[] = [
-  'pothole',
-  'streetlight',
-  'construction',
-  'sidewalk',
-  'trash',
-  'drainage',
-  'water',
-  'sewer',
-  'animal',
-  'parking',
-  'park',
-  'homeless',
-  'other',
-]
+const DEFAULT_TIMELINE_DAYS = 30
+const DEFAULT_STATUS_FILTER: StatusFilter = 'needs-attention'
+const issueTypes: IssueType[] = ['pothole', 'streetlight', 'construction', 'sidewalk']
 const issueColors: Record<IssueType, string> = {
   pothole: '#ef8257',
   streetlight: '#e5ad4e',
   construction: '#6187d9',
   sidewalk: '#4ca98b',
-  trash: '#6c8b4d',
-  drainage: '#62a6c4',
-  water: '#4b7ad6',
-  sewer: '#7d5db0',
-  animal: '#c46d6d',
-  parking: '#d0a24d',
-  park: '#3c8f67',
-  homeless: '#8d5d44',
-  other: '#7d8597',
+}
+
+// Exact City of Sacramento 311 CategoryName values we show, mapped to our issue types.
+// This is an allowlist: it drives both the ArcGIS `where` clause (so nothing else is
+// downloaded) and the client-side mapping. Keyword matching is deliberately avoided —
+// e.g. "Homeless Encampment Blocking Sidewalk" must never be classified as a sidewalk issue.
+// The 311 layer has no dedicated construction category, so "construction" collects the
+// remaining street/right-of-way work that affects people walking and biking.
+const CITY_CATEGORY_ISSUE_TYPES: Record<string, IssueType> = {
+  'Streets Pothole': 'pothole',
+  'Streets Street Maintenance': 'pothole',
+  'Streets Street Lighting': 'streetlight',
+  'Streets Relamp': 'streetlight',
+  'Streets Sidewalk': 'sidewalk',
+  'Streets Curb/Gutter': 'sidewalk',
+  'Streets General': 'construction',
+  'Streets Streetscapes': 'construction',
+  'Streets Signs and Markings': 'construction',
+  'Streets Traffic Signals': 'construction',
+  'Streets Traffic Investigation': 'construction',
+  'Streets Bikeway Issues': 'construction',
+  'Streets Bike Rack Issues': 'construction',
+  'Streets Alley Gate': 'construction',
+}
+const CITY_CATEGORY_WHERE = `CategoryName IN (${Object.keys(CITY_CATEGORY_ISSUE_TYPES)
+  .map((name) => `'${name.replace(/'/g, "''")}'`)
+  .join(', ')})`
+
+function isIssueType(value: unknown): value is IssueType {
+  return typeof value === 'string' && (issueTypes as string[]).includes(value)
 }
 
 const supabaseUrl = appConfig.supabaseUrl
@@ -128,15 +123,6 @@ function issueLabel(issueType: IssueType) {
     streetlight: 'Street light',
     construction: 'Construction',
     sidewalk: 'Sidewalk',
-    trash: 'Trash / solid waste',
-    drainage: 'Drainage',
-    water: 'Water',
-    sewer: 'Sewer',
-    animal: 'Animal control',
-    parking: 'Parking',
-    park: 'Parks / public space',
-    homeless: 'Homeless encampment',
-    other: 'Other',
   }[issueType]
 }
 
@@ -221,6 +207,10 @@ function isWithinDateRange(report: Report, startDate: string, endDate: string) {
   return reportTime >= rangeStart && reportTime < rangeEndExclusive
 }
 
+function getDefaultTimelineStartDate() {
+  return new Date(Date.now() - DEFAULT_TIMELINE_DAYS * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+}
+
 function createTimelineDates(reports: Report[], cityStartDate: string | null) {
   const now = new Date()
   const today = now.toISOString().slice(0, 10)
@@ -251,7 +241,11 @@ function createTimelineDates(reports: Report[], cityStartDate: string | null) {
   }
 
   if (!dates.includes(today)) dates.push(today)
-  return dates
+  // Add the default start as its own stop so the initial range is exactly the last
+  // DEFAULT_TIMELINE_DAYS days instead of snapping back to the previous 1st/15th.
+  const defaultStartDate = getDefaultTimelineStartDate()
+  if (defaultStartDate > firstDate && !dates.includes(defaultStartDate)) dates.push(defaultStartDate)
+  return dates.sort()
 }
 
 function formatTimelineDate(date: string) {
@@ -297,26 +291,8 @@ async function getLocationAddressLabel(location: Coordinates): Promise<string> {
   return `${location.latitude.toFixed(5)}, ${location.longitude.toFixed(5)}`
 }
 
-function normalizeCityIssueType(categoryName: string, categoryLevel1?: string): IssueType {
-  const combined = `${categoryName || ''} ${categoryLevel1 || ''}`.toLowerCase()
-
-  if (combined.includes('pothole')) return 'pothole'
-  if (combined.includes('street light') || combined.includes('street lighting') || combined.includes('streetlight')) return 'streetlight'
-  if (combined.includes('sidewalk') || combined.includes('curb')) return 'sidewalk'
-  if (combined.includes('construction') || combined.includes('roadwork') || combined.includes('road work')) return 'construction'
-  if (combined.includes('street') && (combined.includes('repair') || combined.includes('maintenance'))) return 'pothole'
-  if (combined.includes('drain') || combined.includes('stormwater') || combined.includes('ditch')) return 'drainage'
-  if (combined.includes('sewer') || combined.includes('sanitary')) return 'sewer'
-  if (combined.includes('water') || combined.includes('hydrant') || combined.includes('utility')) return 'water'
-  if (combined.includes('trash') || combined.includes('dumping') || combined.includes('solid waste') || combined.includes('litter') || combined.includes('garbage')) return 'trash'
-  if (combined.includes('animal') || combined.includes('pet')) return 'animal'
-  if (combined.includes('parking') || combined.includes('parked') || combined.includes('parking meter')) return 'parking'
-  if (combined.includes('park') || combined.includes('ranger') || combined.includes('playground') || combined.includes('tree')) return 'park'
-  if (combined.includes('homeless') || combined.includes('encampment')) return 'homeless'
-  if (combined.includes('street') || combined.includes('road') || combined.includes('sign') || combined.includes('traffic')) return 'construction'
-  if (combined.includes('facility') || combined.includes('building') || combined.includes('permit') || combined.includes('planning')) return 'other'
-
-  return 'other'
+function normalizeCityIssueType(categoryName: string): IssueType | null {
+  return Object.hasOwn(CITY_CATEGORY_ISSUE_TYPES, categoryName) ? CITY_CATEGORY_ISSUE_TYPES[categoryName] : null
 }
 
 function normalizeCityStatus(status: string | null | undefined): ReportStatus {
@@ -328,7 +304,7 @@ function normalizeCityStatus(status: string | null | undefined): ReportStatus {
 
 async function fetchCityLayer(layer: number, signal: AbortSignal): Promise<Report[]> {
   const query = new URLSearchParams({
-    where: '1=1',
+    where: CITY_CATEGORY_WHERE,
     outFields: 'OBJECTID,CategoryName,CategoryLevel1,CategoryLevel2,PublicStatus,DateCreated,DateUpdated,Address,CrossStreet,Neighborhood',
     returnGeometry: 'true',
     outSR: '4326',
@@ -353,8 +329,8 @@ function mapCityFeatures(collection: ArcGisFeatureCollection, layer: number): Re
 
     const properties = feature.properties || {}
     const categoryName = String(properties.CategoryName || '').trim()
-    const categoryLevel1 = typeof properties.CategoryLevel1 === 'string' ? properties.CategoryLevel1 : ''
-    const issueType = normalizeCityIssueType(categoryName, categoryLevel1)
+    const issueType = normalizeCityIssueType(categoryName)
+    if (!issueType) return []
 
     const dateCreated = Number(properties.DateCreated)
     const date = Number.isFinite(dateCreated) && dateCreated > 0 ? new Date(dateCreated) : new Date()
@@ -382,7 +358,7 @@ function mapCityFeatures(collection: ArcGisFeatureCollection, layer: number): Re
 
 async function fetchCityTimelineStart(signal: AbortSignal): Promise<string> {
   const query = new URLSearchParams({
-    where: '1=1',
+    where: CITY_CATEGORY_WHERE,
     outStatistics: JSON.stringify([{
       statisticType: 'min',
       onStatisticField: 'DateCreated',
@@ -407,7 +383,7 @@ async function fetchHistoricalCityReports(startDate: string, endDate: string, si
   const endExclusive = new Date(Date.parse(`${endDate}T00:00:00.000Z`) + 24 * 60 * 60 * 1000)
     .toISOString()
     .slice(0, 10)
-  const where = `DateCreated >= TIMESTAMP '${startDate} 00:00:00' AND DateCreated < TIMESTAMP '${endExclusive} 00:00:00' AND (PublicStatus IS NULL OR UPPER(PublicStatus) <> 'CLOSED')`
+  const where = `DateCreated >= TIMESTAMP '${startDate} 00:00:00' AND DateCreated < TIMESTAMP '${endExclusive} 00:00:00' AND (PublicStatus IS NULL OR UPPER(PublicStatus) <> 'CLOSED') AND ${CITY_CATEGORY_WHERE}`
   const reports: Report[] = []
   let resultOffset = 0
 
@@ -437,59 +413,36 @@ async function fetchHistoricalCityReports(startDate: string, endDate: string, si
   return reports
 }
 
-async function fetchLegacyCityLayer(layer: number, signal: AbortSignal): Promise<Report[]> {
+// Counts City requests created in the date range that are now CLOSED. We ask the server for
+// a number instead of downloading every resolved record (tens of thousands of them).
+async function fetchCityClosedCount(startDate: string, endDate: string, types: IssueType[], signal: AbortSignal): Promise<number> {
+  const categories = Object.entries(CITY_CATEGORY_ISSUE_TYPES)
+    .filter(([, issueType]) => types.includes(issueType))
+    .map(([name]) => `'${name.replace(/'/g, "''")}'`)
+  if (categories.length === 0) return 0
+
+  const endExclusive = new Date(Date.parse(`${endDate}T00:00:00.000Z`) + 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10)
   const query = new URLSearchParams({
-    where: '1=1',
-    outFields: 'OBJECTID,CategoryName,DateCreated,CrossStreet,Neighborhood',
-    returnGeometry: 'true',
-    outSR: '4326',
-    geometryPrecision: '5',
-    resultRecordCount: '100',
-    orderByFields: 'DateUpdated DESC',
-    f: 'geojson',
+    where: `DateCreated >= TIMESTAMP '${startDate} 00:00:00' AND DateCreated < TIMESTAMP '${endExclusive} 00:00:00' AND UPPER(PublicStatus) = 'CLOSED' AND CategoryName IN (${categories.join(', ')})`,
+    returnCountOnly: 'true',
+    f: 'json',
   })
-  const response = await fetch(`${LEGACY_CITY_LAYER_URL}/${layer}/query?${query}`, { signal })
-  if (!response.ok) throw new Error(`Legacy city data request failed (${response.status}).`)
+  const response = await fetch(`${CITY_LAYER_URL}/0/query?${query}`, { signal })
+  if (!response.ok) throw new Error(`City closed-count request failed (${response.status}).`)
 
-  const collection = await response.json() as ArcGisFeatureCollection
-  if (collection.error) throw new Error(collection.error.message || 'The legacy Sacramento city data service returned an error.')
-
-  return (collection.features || []).flatMap((feature) => {
-    const position = coordinatesFor(feature)
-    if (!position) return []
-
-    const properties = feature.properties || {}
-    const category = String(properties.CategoryName || (layer === 1 ? 'Pothole' : 'Street light')).toLowerCase()
-    const issueType: IssueType = category.includes('pothole') ? 'pothole' : 'streetlight'
-    const dateCreated = Number(properties.DateCreated)
-    const date = Number.isFinite(dateCreated) && dateCreated > 0 ? new Date(dateCreated) : new Date()
-    const crossStreet = typeof properties.CrossStreet === 'string' ? properties.CrossStreet : ''
-    const neighborhood = typeof properties.Neighborhood === 'string' ? properties.Neighborhood : ''
-    const location = [crossStreet, neighborhood].filter(Boolean).join(' · ')
-
-    return [{
-      id: `legacy-city-${layer}-${String(properties.OBJECTID ?? feature.id ?? crypto.randomUUID())}`,
-      external_id: String(properties.OBJECTID ?? feature.id ?? ''),
-      issue_type: issueType,
-      severity: 'medium' as const,
-      description: `${issueType === 'pothole' ? 'Pothole repair' : 'Street light repair'} recorded by the City${location ? ` near ${location}` : ''}.`,
-      latitude: position.latitude,
-      longitude: position.longitude,
-      status: 'resolved' as const,
-      source: 'city-of-sacramento' as const,
-      created_at: date.toISOString(),
-      address: location || undefined,
-    }]
-  })
+  const result = await response.json() as { count?: number; error?: { message?: string } }
+  if (result.error || typeof result.count !== 'number') {
+    throw new Error(result.error?.message || 'The City closed count could not be loaded.')
+  }
+  return result.count
 }
 
 async function fetchCityReports(signal: AbortSignal) {
-  const [current311, legacyStreetLights, legacyPotholes] = await Promise.all([
-    fetchCityLayer(0, signal),
-    fetchLegacyCityLayer(0, signal),
-    fetchLegacyCityLayer(1, signal),
-  ])
-  return [...legacyPotholes, ...legacyStreetLights, ...current311]
+  // Only the current 311 layer: the old 311_Repairs_WFL1 layer holds repair records from
+  // years ago, all marked resolved, which made the map look out of date.
+  return fetchCityLayer(0, signal)
 }
 
 function getCachedCityReports() {
@@ -503,7 +456,7 @@ function getCachedCityReports() {
       Date.now() - cached.savedAt < CITY_CACHE_TTL_MS &&
       'reports' in cached &&
       isReportArray(cached.reports) &&
-      cached.reports.every((report) => report.source === 'city-of-sacramento')
+      cached.reports.every((report) => report.source === 'city-of-sacramento' && isIssueType(report.issue_type))
     ) {
       return cached.reports
     }
@@ -833,11 +786,12 @@ function App() {
   const [cityLoading, setCityLoading] = useState(true)
   const [reportsLoading, setReportsLoading] = useState(true)
   const [cityError, setCityError] = useState('')
+  const [cityClosedCount, setCityClosedCount] = useState<number | null>(null)
   const [reportsError, setReportsError] = useState('')
   const [typeFilter, setTypeFilter] = useState<IssueType | 'all'>('all')
   const [visibleIssueTypes, setVisibleIssueTypes] = useState<IssueType[]>(issueTypes)
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>(DEFAULT_STATUS_FILTER)
   const [timelineRange, setTimelineRange] = useState<{ start: number; end: number } | null>(null)
   const [deviceLocation, setDeviceLocation] = useState<Coordinates | null>(null)
   const [nearMeLocation, setNearMeLocation] = useState<Coordinates | null>(null)
@@ -908,29 +862,6 @@ function App() {
   }, [isPlacing])
 
   useEffect(() => {
-    let active = true
-    setIsLocating(true)
-    setNearMeError('')
-
-    void getCurrentPosition()
-      .then((location) => {
-        if (active) {
-          setDeviceLocation(location)
-          setNearMeLocation(location)
-          setIsNearMeActive(true)
-        }
-      })
-      .catch((error: unknown) => {
-        if (active) setNearMeError(error instanceof Error ? error.message : 'Unable to get your location.')
-      })
-      .finally(() => {
-        if (active) setIsLocating(false)
-      })
-
-    return () => { active = false }
-  }, [])
-
-  useEffect(() => {
     if (!draftLocation) return
     setDescription((current) => {
       const trimmed = current.trim()
@@ -974,11 +905,12 @@ function App() {
             .from('reports')
             .select('id, issue_type, description, severity, latitude, longitude, status, source, created_at, external_id, confirmation_count')
             .eq('source', 'user')
+            .in('issue_type', issueTypes)
             .order('created_at', { ascending: false })
             .limit(1000)
           if (error) throw new Error(`Could not load saved reports: ${error.message}`)
           if (active) {
-            setUserReports((data || []).map((row) => ({
+            setUserReports((data || []).filter((row) => isIssueType(row.issue_type)).map((row) => ({
               id: row.id,
               issue_type: row.issue_type as IssueType,
               description: row.description,
@@ -995,7 +927,7 @@ function App() {
         } else {
           const savedReports: unknown = JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEY) || '[]')
           if (!isReportArray(savedReports)) throw new Error('Saved reports have an unexpected format. Clear the browser storage and try again.')
-          if (active) setUserReports(savedReports.map((report) => ({
+          if (active) setUserReports(savedReports.filter((report) => isIssueType(report.issue_type)).map((report) => ({
             ...report,
             confirmation_count: report.confirmation_count ?? 0,
           })))
@@ -1020,7 +952,7 @@ function App() {
   }, [userReports, cityReports, historicalCityReports])
   const timelineDates = useMemo(() => createTimelineDates(userReports, cityStartDate), [userReports, cityStartDate])
   const timelineEndIndex = timelineDates.length - 1
-  const defaultTimelineStartDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+  const defaultTimelineStartDate = getDefaultTimelineStartDate()
   let defaultTimelineStartIndex = 0
   for (let index = 0; index < timelineDates.length; index += 1) {
     if (timelineDates[index] > defaultTimelineStartDate) break
@@ -1063,6 +995,25 @@ function App() {
     }
   }, [cityStartDate, timelineStartDate, timelineEndDate])
 
+  const countedIssueTypes = useMemo(
+    () => visibleIssueTypes.filter((issueType) => typeFilter === 'all' || issueType === typeFilter),
+    [visibleIssueTypes, typeFilter],
+  )
+
+  useEffect(() => {
+    if (!timelineStartDate || !timelineEndDate) return
+
+    const controller = new AbortController()
+    setCityClosedCount(null)
+    fetchCityClosedCount(timelineStartDate, timelineEndDate, countedIssueTypes, controller.signal)
+      .then(setCityClosedCount)
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) console.warn('Unable to load the City closed count.', error)
+      })
+
+    return () => controller.abort()
+  }, [timelineStartDate, timelineEndDate, countedIssueTypes])
+
   const summaryReports = useMemo(() => reports.filter((report) =>
     (typeFilter === 'all' || report.issue_type === typeFilter) &&
     visibleIssueTypes.includes(report.issue_type) &&
@@ -1088,8 +1039,17 @@ function App() {
     [myReports, selectedMyReportId],
   )
 
+  // "ON THE MAP" and the sidebar footer both show the number of markers actually drawn.
+  const onTheMapCount = filteredReports.length
   const openCount = summaryReports.filter((report) => report.status !== 'resolved').length
-  const resolvedCount = summaryReports.length - openCount
+  // Closed City requests come from the server count (we don't download them all). Fall back
+  // to the loaded records if the count failed, or when "near me" is on, because the server
+  // count covers the whole city rather than your 5 km radius.
+  const localResolvedCount = summaryReports.length - openCount
+  const userResolvedCount = summaryReports.filter((report) => report.source === 'user' && report.status === 'resolved').length
+  const resolvedCount = cityClosedCount !== null && sourceFilter !== 'user' && !isNearMeActive
+    ? cityClosedCount + userResolvedCount
+    : localResolvedCount
   const isLoading = cityLoading || reportsLoading
 
   async function confirmReport(report: Report) {
@@ -1505,8 +1465,8 @@ function App() {
           <section className="stats-grid" aria-label="Report statistics">
             <button type="button" className={`stat-card stat-total ${statusFilter === 'all' ? 'active' : ''}`} onClick={() => toggleStatusFilter('all')}>
               <span className="stat-label">ON THE MAP</span>
-              <strong>{isLoading ? '—' : summaryReports.length.toLocaleString()}</strong>
-              <span className="stat-caption">total reports</span>
+              <strong>{isLoading ? '—' : onTheMapCount.toLocaleString()}</strong>
+              <span className="stat-caption">reports shown</span>
             </button>
             <button type="button" className={`stat-card ${statusFilter === 'needs-attention' ? 'active' : ''}`} onClick={() => toggleStatusFilter('needs-attention')}>
               <span className="stat-label">NEEDS ATTENTION</span>
@@ -1742,13 +1702,13 @@ function App() {
           <div className="sidebar-footer">
             <div className="data-status">
               <span className={`status-pulse ${cityError ? 'error' : ''}`} />
-              <span>{cityLoading ? 'Connecting to city data…' : cityError ? 'City data unavailable' : 'City 311 repair records'}</span>
-              <a href="https://services5.arcgis.com/54falWtcpty3V47Z/arcgis/rest/services/311_Repairs_WFL1/FeatureServer" target="_blank" rel="noreferrer" aria-label="Open City of Sacramento data source"><ArrowUpRight size={13} /></a>
+              <span>{cityLoading ? 'Connecting to city data…' : cityError ? 'City data unavailable' : 'City 311 service requests'}</span>
+              <a href="https://data.cityofsacramento.org/datasets/sacramento-311-calls-view-current/about" target="_blank" rel="noreferrer" aria-label="Open City of Sacramento data source"><ArrowUpRight size={13} /></a>
             </div>
             <p>The prototype aggregates public government infrastructure data and combines it with community-submitted reports.</p>
             {cityError && <p className="data-error" role="alert">{cityError}</p>}
             {reportsError && <p className="data-error" role="alert">{reportsError}</p>}
-            {cityReports.length > 0 && <span className="last-updated"><Radio size={11} /> {cityReports.length} public repair records loaded</span>}
+            {!isLoading && <span className="last-updated"><Radio size={11} /> {onTheMapCount.toLocaleString()} {onTheMapCount === 1 ? 'report' : 'reports'} on the map</span>}
           </div>
         </aside>
 
@@ -1961,7 +1921,6 @@ function App() {
               </div>
             </div>
           )}
-          <div className="map-overlay map-overlay-top"><span className="map-area-dot" /> SACRAMENTO <span className="map-overlay-divider">/</span> CENTRAL CITY</div>
           {isPlacing && !draftLocation && <div className="map-instruction"><ArrowDown size={15} /> Click the map to place your report</div>}
           {isPlacing && draftLocation && !reportPanelOpen && (
             <div className="map-instruction"><MapPin size={15} /> Location selected — complete the report below</div>
