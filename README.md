@@ -20,9 +20,9 @@ The map and public City records work without API keys. Until Supabase is configu
 ## What is on the map
 
 - The public source is the [City of Sacramento 311 Repairs ArcGIS service](https://services5.arcgis.com/54falWtcpty3V47Z/arcgis/rest/services/311_Repairs_WFL1/FeatureServer). Its public layers contain pothole repairs and street-light fixes.
-- To keep the map responsive, it initially loads a recent sample of City records and caches it in this browser for 30 minutes. The timeline reads the full date extent from the City 311 layer and fetches currently open or in-progress records for the selected range in paginated requests.
+- To keep the map responsive, it initially loads a recent sample of City records and caches it in this browser for 30 minutes. The timeline reads the full date extent from the City 311 layer and fetches records for the selected dates in paginated requests.
 - These are repair records, not a feed of current open work orders. The prototype presents them as resolved City records and does not submit reports to the City.
-- The basemap uses CARTO's Voyager tiles with your CARTO Basemaps key when configured; without a key, it falls back to CARTO's public light tiles.
+- The basemap uses the Google Maps JavaScript API. A Google Maps API key with the Maps JavaScript API enabled is required; the map displays setup guidance until a key is configured.
 - On opening the map, your browser asks whether to share your location. If allowed, the map centers on you and shows loaded reports within 5 km; if denied, Sacramento remains the default map location. You can change the nearby filter at any time. The map only searches reports currently loaded by the prototype.
 - Use the issue-type checkboxes to show or hide each category. Filter by type and source, and use the dashboard timeline to choose a date range. Timeline stops use the 1st, 15th, and last day of each month; the default range is the last 90 days. The timeline queries the City 311 layer for matching history, and resolved reports are hidden. Click **Report an issue**, click a location on the map, fill out the form, and submit.
 
@@ -102,16 +102,17 @@ create trigger report_confirmation_inserted
 
 Community reports are initially **Unconfirmed**. A report is shown as **Confirmed by N people** after three confirmations. Each browser installation can confirm each report once; this anonymous demo does not verify a person's identity. In local-storage mode, confirmations are only stored in that browser. Supabase is required to share confirmation counts across browsers.
 
-In the project folder, create `.env.local` and add the **CARTO Basemaps key** you received. Add the **Project URL** and **anon/public key** too if you are connecting Supabase:
+In the project folder, create `.env.local` and add your **Google Maps API key**. In Google Cloud, enable the Maps JavaScript API and configure billing for the project. Restrict the key to your site's referrers and the Maps JavaScript API. To hide built-in landmark icons, create and publish a map style in Google Maps Platform > Map Styles, set Points of interest > Landmarks > Icons to hidden, create a map ID, and associate the published style with it. Set that ID in `VITE_GOOGLE_MAP_ID`; without it, the app uses Google's demo map ID. Add the **Project URL** and **anon/public key** too if you are connecting Supabase:
 
 ```text
-VITE_CARTO_BASEMAP_KEY=your-carto-basemaps-key
+VITE_GOOGLE_MAPS_API_KEY=your-google-maps-api-key
+VITE_GOOGLE_MAP_ID=your-styled-map-id
 VITE_SUPABASE_URL=https://your-project.supabase.co
 VITE_SUPABASE_ANON_KEY=your-public-anon-key
 ```
 
-Restart `npm run dev` after changing environment variables. Vite exposes `VITE_` values to the browser, and a basemap key is sent to CARTO with tile requests. Restrict the key to your website's domain in CARTO and never commit `.env.local`. Never put a Supabase `service_role` key in a browser app. These open demo policies allow anyone to read and submit reports; use stronger policies and abuse prevention before a public production launch.
+Restart `npm run dev` after changing environment variables. Vite exposes `VITE_` values to the browser, so the Google Maps key is visible to users and must be restricted in Google Cloud; never commit `.env.local`. Never put a Supabase `service_role` key in a browser app. These open demo policies allow anyone to read and submit reports; use stronger policies and abuse prevention before a public production launch.
 
 ## Deploy to Vercel
 
-Import this folder as its own Vercel project, use the default Vite build settings (`npm run build`, output folder `dist`), and add `VITE_CARTO_BASEMAP_KEY` and, if Supabase is enabled, the two Supabase environment variables in the Vercel project settings.
+Import this folder as its own Vercel project, use the default Vite build settings (`npm run build`, output folder `dist`), and add `VITE_GOOGLE_MAPS_API_KEY`, `VITE_GOOGLE_MAP_ID` if using a custom map style, and, if Supabase is enabled, the two Supabase environment variables in the Vercel project settings.

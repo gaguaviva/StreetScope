@@ -10,7 +10,8 @@ export const appConfig = {
   reportApiToken: (env.VITE_REPORT_API_TOKEN || '').trim(),
   supabaseUrl: (env.VITE_SUPABASE_URL || '').trim(),
   supabaseAnonKey: (env.VITE_SUPABASE_ANON_KEY || '').trim(),
-  cartoBasemapKey: (env.VITE_CARTO_BASEMAP_KEY || '').trim(),
+  googleMapsApiKey: (env.VITE_GOOGLE_MAPS_API_KEY || '').trim(),
+  googleMapsMapId: (env.VITE_GOOGLE_MAP_ID || '').trim(),
   cityDataSourceUrls: (env.VITE_CITY_DATASET_URLS || '')
     .split(';')
     .map((value: string) => value.trim())

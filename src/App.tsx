@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, FormEvent, PointerEvent as ReactPointerEvent } from 'react'
-import { MapContainer, TileLayer, CircleMarker, Marker, Popup, useMap, useMapEvents } from 'react-leaflet'
-import { divIcon, latLngBounds } from 'leaflet'
+import { CircleF, GoogleMap, InfoWindowF, useJsApiLoader } from '@react-google-maps/api'
+import type { Libraries } from '@react-google-maps/api'
 import { createClient } from '@supabase/supabase-js'
 import { AlertCircle, ArrowDown, ArrowUpRight, ChevronDown, Crosshair, Filter, LocateFixed, MapPin, Plus, Radio, Search, X } from 'lucide-react'
 import { appConfig } from './config'
@@ -21,13 +21,21 @@ type IssueType =
   | 'homeless'
   | 'other'
 type Severity = 'low' | 'medium' | 'high'
-type ReportStatus = 'open' | 'in-progress' | 'resolved'
+type ReportStatus = 'open' | 'in-progress' | 'resolved' | 'cancelled'
 type ReportSource = 'user' | 'city-of-sacramento'
 type SourceFilter = 'all' | ReportSource
 type StatusFilter = 'all' | ReportStatus | 'needs-attention'
 interface Coordinates {
   latitude: number
   longitude: number
+}
+
+interface MapViewport {
+  north: number
+  south: number
+  east: number
+  west: number
+  zoom: number
 }
 
 interface Report {
@@ -65,6 +73,10 @@ const LEGACY_CITY_LAYER_URL = appConfig.legacyCityLayerUrl
 const CITY_CACHE_KEY = 'sacramento-city-repair-cache'
 const CITY_CACHE_TTL_MS = 30 * 60 * 1000
 const CITY_PAGE_SIZE = 2000
+const MAX_CUMULATIVE_REPORTS = 10000
+const CUMULATIVE_SAMPLE_PAGE_SIZE = 250
+const CUMULATIVE_SAMPLE_CONCURRENCY = 5
+const MAX_RENDERED_REPORT_MARKERS = 1000
 const LOCAL_STORAGE_KEY = 'sacramento-infrastructure-reports'
 const LOCAL_CONFIRMATIONS_KEY = 'sacramento-infrastructure-confirmations'
 const CONFIRMER_ID_KEY = 'sacramento-infrastructure-confirmer-id'
@@ -105,7 +117,10 @@ const issueColors: Record<IssueType, string> = {
 const supabaseUrl = appConfig.supabaseUrl
 const supabaseAnonKey = appConfig.supabaseAnonKey
 const supabase = supabaseUrl && supabaseAnonKey ? createClient(supabaseUrl, supabaseAnonKey) : null
-const cartoBasemapKey = appConfig.cartoBasemapKey
+const googleMapsApiKey = appConfig.googleMapsApiKey
+const googleMapsMapId = appConfig.googleMapsMapId || 'DEMO_MAP_ID'
+const googleMapsLibraries: Libraries = ['marker']
+const initialMapCenter: google.maps.LatLngLiteral = { lat: 38.5816, lng: -121.4944 }
 const reportApiUrl = appConfig.reportApiUrl
 const reportApiToken = appConfig.reportApiToken
 let locationRequest: Promise<Coordinates> | null = null
@@ -145,6 +160,7 @@ function statusLabel(status: ReportStatus | 'needs-attention') {
     open: 'Open',
     'in-progress': 'In-progress',
     resolved: 'Resolved',
+    cancelled: 'Cancelled',
     'needs-attention': 'Needs attention',
   }[status]
 }
@@ -221,37 +237,14 @@ function isWithinDateRange(report: Report, startDate: string, endDate: string) {
   return reportTime >= rangeStart && reportTime < rangeEndExclusive
 }
 
-function createTimelineDates(reports: Report[], cityStartDate: string | null) {
-  const now = new Date()
-  const today = now.toISOString().slice(0, 10)
-  const timestamps = reports
-    .map((report) => Date.parse(report.created_at))
-    .filter(Number.isFinite)
-  const reportStartDate = timestamps.length > 0
-    ? new Date(Math.min(...timestamps)).toISOString().slice(0, 10)
-    : null
-  const firstDate = [cityStartDate, reportStartDate].filter((date): date is string => date !== null).sort()[0]
-    || new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
-  const earliest = new Date(`${firstDate}T00:00:00.000Z`)
-  const dates: string[] = [firstDate]
+function addDaysToDate(date: string, days: number) {
+  return new Date(Date.parse(`${date}T00:00:00.000Z`) + days * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10)
+}
 
-  for (let year = earliest.getUTCFullYear(), month = earliest.getUTCMonth(); ; ) {
-    const lastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate()
-    for (const day of [1, 15, lastDay]) {
-      const date = new Date(Date.UTC(year, month, day)).toISOString().slice(0, 10)
-      if (date <= today && !dates.includes(date)) dates.push(date)
-    }
-
-    if (year === now.getUTCFullYear() && month === now.getUTCMonth()) break
-    month += 1
-    if (month > 11) {
-      month = 0
-      year += 1
-    }
-  }
-
-  if (!dates.includes(today)) dates.push(today)
-  return dates
+function daysBetweenDates(startDate: string, endDate: string) {
+  return Math.max(0, Math.round((Date.parse(endDate) - Date.parse(startDate)) / (24 * 60 * 60 * 1000)))
 }
 
 function formatTimelineDate(date: string) {
@@ -321,7 +314,8 @@ function normalizeCityIssueType(categoryName: string, categoryLevel1?: string): 
 
 function normalizeCityStatus(status: string | null | undefined): ReportStatus {
   const normalized = String(status || '').trim().toLowerCase()
-  if (normalized === 'closed') return 'resolved'
+  if (normalized === 'closed' || normalized === 'resolved') return 'resolved'
+  if (normalized === 'cancelled' || normalized === 'canceled') return 'cancelled'
   if (normalized === 'in progress' || normalized === 'in-progress') return 'in-progress'
   return 'open'
 }
@@ -403,38 +397,68 @@ async function fetchCityTimelineStart(signal: AbortSignal): Promise<string> {
   return new Date(earliestDate).toISOString().slice(0, 10)
 }
 
-async function fetchHistoricalCityReports(startDate: string, endDate: string, signal: AbortSignal): Promise<Report[]> {
+async function fetchHistoricalCityReports(
+  startDate: string,
+  endDate: string,
+  signal: AbortSignal,
+): Promise<{ reports: Report[]; sampled: boolean }> {
   const endExclusive = new Date(Date.parse(`${endDate}T00:00:00.000Z`) + 24 * 60 * 60 * 1000)
     .toISOString()
     .slice(0, 10)
-  const where = `DateCreated >= TIMESTAMP '${startDate} 00:00:00' AND DateCreated < TIMESTAMP '${endExclusive} 00:00:00' AND (PublicStatus IS NULL OR UPPER(PublicStatus) <> 'CLOSED')`
+  const where = `DateCreated >= TIMESTAMP '${startDate} 00:00:00' AND DateCreated < TIMESTAMP '${endExclusive} 00:00:00'`
+  const countQuery = new URLSearchParams({
+    where,
+    returnCountOnly: 'true',
+    f: 'json',
+  })
+  const countResponse = await fetch(`${CITY_LAYER_URL}/0/query?${countQuery}`, { signal })
+  if (!countResponse.ok) throw new Error(`Historical City count request failed (${countResponse.status}).`)
+
+  const countResult = await countResponse.json() as { count?: number; error?: { message?: string } }
+  if (countResult.error) throw new Error(countResult.error.message || 'Historical City report count could not be loaded.')
+  if (typeof countResult.count !== 'number' || !Number.isFinite(countResult.count)) {
+    throw new Error('The City data source returned an invalid historical report count.')
+  }
+  const totalCount = countResult.count
+
+  const sampled = totalCount > MAX_CUMULATIVE_REPORTS &&
+    Date.parse(endDate) - Date.parse(startDate) >= 24 * 60 * 60 * 1000
+  const pageSize = sampled ? CUMULATIVE_SAMPLE_PAGE_SIZE : CITY_PAGE_SIZE
+  const pageCount = sampled
+    ? Math.ceil(MAX_CUMULATIVE_REPORTS / pageSize)
+    : Math.ceil(totalCount / pageSize)
+  const pageOffsets = sampled
+    ? Array.from({ length: pageCount }, (_, index) =>
+        Math.round(index * (totalCount - pageSize) / (pageCount - 1)),
+      )
+    : Array.from({ length: pageCount }, (_, index) => index * pageSize)
   const reports: Report[] = []
-  let resultOffset = 0
 
-  while (true) {
-    const query = new URLSearchParams({
-      where,
-      outFields: 'OBJECTID,CategoryName,CategoryLevel1,CategoryLevel2,PublicStatus,DateCreated,DateUpdated,Address,CrossStreet,Neighborhood',
-      returnGeometry: 'true',
-      outSR: '4326',
-      geometryPrecision: '5',
-      resultRecordCount: String(CITY_PAGE_SIZE),
-      resultOffset: String(resultOffset),
-      orderByFields: 'DateCreated ASC, OBJECTID ASC',
-      f: 'geojson',
-    })
-    const response = await fetch(`${CITY_LAYER_URL}/0/query?${query}`, { signal })
-    if (!response.ok) throw new Error(`Historical City data request failed (${response.status}).`)
+  for (let batchStart = 0; batchStart < pageOffsets.length; batchStart += CUMULATIVE_SAMPLE_CONCURRENCY) {
+    const batchOffsets = pageOffsets.slice(batchStart, batchStart + CUMULATIVE_SAMPLE_CONCURRENCY)
+    const collections = await Promise.all(batchOffsets.map(async (resultOffset) => {
+      const query = new URLSearchParams({
+        where,
+        outFields: 'OBJECTID,CategoryName,CategoryLevel1,CategoryLevel2,PublicStatus,DateCreated,DateUpdated,Address,CrossStreet,Neighborhood',
+        returnGeometry: 'true',
+        outSR: '4326',
+        geometryPrecision: '5',
+        resultRecordCount: String(Math.min(pageSize, totalCount - resultOffset)),
+        resultOffset: String(resultOffset),
+        orderByFields: 'DateCreated DESC, OBJECTID DESC',
+        f: 'geojson',
+      })
+      const response = await fetch(`${CITY_LAYER_URL}/0/query?${query}`, { signal })
+      if (!response.ok) throw new Error(`Historical City data request failed (${response.status}).`)
 
-    const collection = await response.json() as ArcGisFeatureCollection
-    if (collection.error) throw new Error(collection.error.message || 'Historical City data could not be loaded.')
-    const features = collection.features || []
-    reports.push(...mapCityFeatures(collection, 0))
-    if (features.length === 0 || (features.length < CITY_PAGE_SIZE && !collection.exceededTransferLimit)) break
-    resultOffset += features.length
+      const collection = await response.json() as ArcGisFeatureCollection
+      if (collection.error) throw new Error(collection.error.message || 'Historical City data could not be loaded.')
+      return collection
+    }))
+    collections.forEach((collection) => reports.push(...mapCityFeatures(collection, 0)))
   }
 
-  return reports
+  return { reports, sampled }
 }
 
 async function fetchLegacyCityLayer(layer: number, signal: AbortSignal): Promise<Report[]> {
@@ -576,66 +600,32 @@ function readConfirmedReportIds() {
   return savedIds.filter((id): id is string => typeof id === 'string')
 }
 
-function MapClickHandler({ enabled, onSelect }: { enabled: boolean; onSelect: (latitude: number, longitude: number) => void }) {
-  useMapEvents({
-    click(event) {
-      if (enabled) onSelect(event.latlng.lat, event.latlng.lng)
-    },
-  })
-  return null
-}
-
-function MapSizeInvalidator() {
-  const map = useMap()
-
-  useEffect(() => {
-    let frame = 0
-    const invalidateSize = () => {
-      cancelAnimationFrame(frame)
-      frame = requestAnimationFrame(() => map.invalidateSize({ pan: false }))
-    }
-
-    invalidateSize()
-    const container = map.getContainer()
-    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(invalidateSize)
-    observer?.observe(container)
-    window.addEventListener('resize', invalidateSize)
-
-    return () => {
-      cancelAnimationFrame(frame)
-      observer?.disconnect()
-      window.removeEventListener('resize', invalidateSize)
-    }
-  }, [map])
-
-  return null
-}
-
 function MapControls({
+  map,
   location,
   onLocationFound,
   onLocationError,
 }: {
+  map: google.maps.Map
   location: Coordinates | null
   onLocationFound: (location: Coordinates) => void
   onLocationError: (message: string) => void
 }) {
-  const map = useMap()
-  const [zoom, setZoom] = useState(map.getZoom())
+  const [zoom, setZoom] = useState(map.getZoom() ?? 13)
   const [isLocating, setIsLocating] = useState(false)
 
   useEffect(() => {
-    const updateZoom = () => setZoom(map.getZoom())
-    map.on('zoomend', updateZoom)
+    const zoomListener = map.addListener('zoom_changed', () => setZoom(map.getZoom() ?? 13))
     return () => {
-      map.off('zoomend', updateZoom)
+      google.maps.event.removeListener(zoomListener)
     }
   }, [map])
 
   async function recenterOnMyLocation() {
     onLocationError('')
     if (location) {
-      map.setView([location.latitude, location.longitude], 15, { animate: false })
+      map.panTo({ lat: location.latitude, lng: location.longitude })
+      map.setZoom(15)
       return
     }
 
@@ -643,7 +633,8 @@ function MapControls({
     try {
       const currentLocation = await getCurrentPosition()
       onLocationFound(currentLocation)
-      map.setView([currentLocation.latitude, currentLocation.longitude], 15, { animate: false })
+      map.panTo({ lat: currentLocation.latitude, lng: currentLocation.longitude })
+      map.setZoom(15)
     } catch (error) {
       onLocationError(error instanceof Error ? error.message : 'Unable to get your location.')
     } finally {
@@ -668,8 +659,8 @@ function MapControls({
         type="button"
         aria-label="Zoom in"
         title="Zoom in"
-        onClick={() => map.zoomIn()}
-        disabled={zoom >= map.getMaxZoom()}
+        onClick={() => map.setZoom(zoom + 1)}
+        disabled={zoom >= 18}
       >
         +
       </button>
@@ -678,8 +669,8 @@ function MapControls({
         type="button"
         aria-label="Zoom out"
         title="Zoom out"
-        onClick={() => map.zoomOut()}
-        disabled={zoom <= map.getMinZoom()}
+        onClick={() => map.setZoom(zoom - 1)}
+        disabled={zoom <= 10}
       >
         -
       </button>
@@ -687,136 +678,421 @@ function MapControls({
   )
 }
 
-function MyReportsMapController({
-  report,
-}: {
-  report: Report | null
-}) {
-  const map = useMap()
-
-  useEffect(() => {
-    if (!report) return
-    map.flyTo([report.latitude, report.longitude], 15, { duration: 0.8 })
-  }, [map, report])
-
-  return null
-}
-
-function NearbyMapController({
-  active,
-  location,
-  reports,
-}: {
-  active: boolean
-  location: Coordinates | null
+interface GoogleMapSurfaceProps {
+  isPlacing: boolean
+  onMapSelect: (latitude: number, longitude: number) => void
+  deviceLocation: Coordinates | null
+  onLocationFound: (location: Coordinates) => void
+  onLocationError: (message: string) => void
+  selectedReport: Report | null
+  isNearMeActive: boolean
+  nearMeLocation: Coordinates | null
+  locationLabel: string
   reports: Report[]
-}) {
-  const map = useMap()
-  const lastFitTarget = useRef<string | null>(null)
-
-  useEffect(() => {
-    if (!active || !location) {
-      lastFitTarget.current = null
-      return
-    }
-
-    const fitTarget = `${location.latitude},${location.longitude}`
-    if (lastFitTarget.current === fitTarget) return
-    lastFitTarget.current = fitTarget
-
-    if (reports.length > 0) {
-      const bounds = latLngBounds([
-        [location.latitude, location.longitude],
-        ...reports.map((report) => [report.latitude, report.longitude] as [number, number]),
-      ])
-      map.fitBounds(bounds.pad(0.18), { maxZoom: 15, animate: false })
-    } else {
-      map.setView([location.latitude, location.longitude], 15, { animate: false })
-    }
-  }, [active, location, map, reports])
-
-  return null
+  draftLocation: Coordinates | null
+  issueType: IssueType
+  confirmedReportIds: Set<string>
+  confirmingReportIds: Set<string>
+  confirmationErrors: Record<string, string>
+  confirmationSetupError: string
+  onConfirm: (report: Report) => void
 }
 
-function ReportMarker({
+function GoogleMapSurface(props: GoogleMapSurfaceProps) {
+  if (!googleMapsApiKey) {
+    return (
+      <div className="map-api-message" role="status">
+        <strong>Google Maps API key required</strong>
+        <span>Add <code>VITE_GOOGLE_MAPS_API_KEY</code> to <code>.env.local</code>, then restart the app.</span>
+      </div>
+    )
+  }
+
+  return <LoadedGoogleMap {...props} />
+}
+
+function ReportAdvancedMarker({
+  map,
   report,
+  isOpen,
+  onClick,
+  onClose,
   hasConfirmed,
   isConfirming,
   confirmationError,
   onConfirm,
 }: {
+  map: google.maps.Map
   report: Report
+  isOpen: boolean
+  onClick: (reportId: string) => void
+  onClose: () => void
   hasConfirmed: boolean
   isConfirming: boolean
   confirmationError?: string
   onConfirm: () => void
 }) {
   const color = issueColors[report.issue_type]
+  const outlineColor = report.status === 'resolved'
+    ? '#278248'
+    : report.status === 'cancelled'
+      ? '#454b46'
+      : '#d52f36'
+  const glyphText = report.status === 'open'
+    ? 'X'
+    : report.status === 'in-progress'
+      ? '!'
+      : report.status === 'resolved'
+        ? '✓'
+        : '–'
+  const reportPosition = { lat: report.latitude, lng: report.longitude }
+
+  useEffect(() => {
+    let active = true
+    let marker: google.maps.marker.AdvancedMarkerElement | null = null
+    const handleClick = () => onClick(report.id)
+
+    void google.maps.importLibrary('marker').then(({ AdvancedMarkerElement, PinElement }) => {
+      if (!active) return
+
+      const pin = new PinElement({
+        background: color,
+        borderColor: outlineColor,
+        glyphColor: '#ffffff',
+        glyphText,
+        scale: report.source === 'user' ? 1.55 : 1.4,
+      })
+      pin.style.filter = [
+        'drop-shadow(1px 0 0 #111111)',
+        'drop-shadow(-1px 0 0 #111111)',
+        'drop-shadow(0 1px 0 #111111)',
+        'drop-shadow(0 -1px 0 #111111)',
+        'drop-shadow(2px 0 0 #111111)',
+        'drop-shadow(-2px 0 0 #111111)',
+        'drop-shadow(0 2px 0 #111111)',
+        'drop-shadow(0 -2px 0 #111111)',
+      ].join(' ')
+      marker = new AdvancedMarkerElement({
+        map,
+        position: reportPosition,
+        title: `${issueLabel(report.issue_type)} · ${statusLabel(report.status)}`,
+        content: pin,
+        gmpClickable: true,
+      })
+      marker.addEventListener('gmp-click', handleClick)
+    })
+
+    return () => {
+      active = false
+      if (marker) {
+        marker.removeEventListener('gmp-click', handleClick)
+        marker.map = null
+      }
+    }
+  }, [map, report, color, onClick])
+
   const confirmationCount = report.confirmation_count ?? 0
   const isConfirmed = confirmationCount >= CONFIRMATION_THRESHOLD
-  const locationText = reportLocationLabel(report)
   const reportDate = new Date(report.created_at).toLocaleDateString()
   const reportTime = new Date(report.created_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+
   return (
-    <CircleMarker
-      center={[report.latitude, report.longitude]}
-      radius={report.source === 'user' ? 8 : 6}
-      pathOptions={{ color, fillColor: color, fillOpacity: 0.86, weight: 2 }}
-    >
-      <Popup>
-        <div className="popup-content">
-          <div className="popup-topline">
-            <span className="popup-dot" style={{ backgroundColor: color }} />
-            <strong>{issueLabel(report.issue_type)}</strong>
-            <span className="popup-time">{reportTime}</span>
-            <span className={`popup-status ${report.status}`}>{statusLabel(report.status)}</span>
-          </div>
-          {report.status !== 'resolved' && <span className="popup-age">{reportAgeLabel(report)}</span>}
-          {report.source === 'user' && (
-            <div className={`report-confirmation ${isConfirmed ? 'confirmed' : 'unconfirmed'}`}>
-              <span>{isConfirmed ? `Confirmed by ${confirmationCount} people` : `Unconfirmed · ${confirmationCount}/${CONFIRMATION_THRESHOLD} confirmations`}</span>
-              {report.status !== 'resolved' && (
-                <button type="button" onClick={onConfirm} disabled={hasConfirmed || isConfirming}>
-                  {isConfirming ? 'Confirming…' : hasConfirmed ? 'You confirmed this report' : 'Confirm this report'}
-                </button>
-              )}
-              {confirmationError && <span className="confirmation-error" role="alert">{confirmationError}</span>}
+    <>
+      {isOpen && (
+        <InfoWindowF
+          position={reportPosition}
+          onCloseClick={onClose}
+          options={{ maxWidth: 320 }}
+        >
+          <div className="popup-content">
+            <div className="popup-topline">
+              <span className="popup-dot" style={{ backgroundColor: color }} />
+              <strong>{issueLabel(report.issue_type)}</strong>
+              <span className="popup-time">{reportTime}</span>
+              <span className={`popup-status ${report.status}`}>{statusLabel(report.status)}</span>
             </div>
-          )}
-          <p>{report.description}</p>
-          <div className="popup-meta">
-            <span>Found at {locationText}</span>
-            <div className="popup-meta-row">
-              <span className="popup-meta-source">{sourceLabel(report.source)}</span>
-              <span className="popup-meta-date">{reportDate}</span>
+            {report.status !== 'resolved' && <span className="popup-age">{reportAgeLabel(report)}</span>}
+            {report.source === 'user' && (
+              <div className={`report-confirmation ${isConfirmed ? 'confirmed' : 'unconfirmed'}`}>
+                <span>{isConfirmed ? `Confirmed by ${confirmationCount} people` : `Unconfirmed · ${confirmationCount}/${CONFIRMATION_THRESHOLD} confirmations`}</span>
+                {report.status !== 'resolved' && (
+                  <button type="button" onClick={onConfirm} disabled={hasConfirmed || isConfirming}>
+                    {isConfirming ? 'Confirming…' : hasConfirmed ? 'You confirmed this report' : 'Confirm this report'}
+                  </button>
+                )}
+                {confirmationError && <span className="confirmation-error" role="alert">{confirmationError}</span>}
+              </div>
+            )}
+            <p>{report.description}</p>
+            <div className="popup-meta">
+              <span>Found at {reportLocationLabel(report)}</span>
+              <div className="popup-meta-row">
+                <span className="popup-meta-source">{sourceLabel(report.source)}</span>
+                <span className="popup-meta-date">{reportDate}</span>
+              </div>
             </div>
           </div>
-        </div>
-      </Popup>
-    </CircleMarker>
+        </InfoWindowF>
+      )}
+    </>
   )
 }
 
-function UserLocationMarker({ location, label }: { location: Coordinates; label: string }) {
-  const userIcon = divIcon({
-    className: 'user-location-marker',
-    html: '<span class="user-location-marker-core"></span>',
-    iconSize: [18, 18],
-    iconAnchor: [9, 9],
-    popupAnchor: [0, -12],
+function LocationAdvancedMarker({
+  map,
+  location,
+  label,
+  onClick,
+}: {
+  map: google.maps.Map
+  location: Coordinates
+  label: string
+  onClick: () => void
+}) {
+  useEffect(() => {
+    let active = true
+    let marker: google.maps.marker.AdvancedMarkerElement | null = null
+
+    void google.maps.importLibrary('marker').then(({ AdvancedMarkerElement, PinElement }) => {
+      if (!active) return
+
+      const pin = new PinElement({
+        background: '#567052',
+        borderColor: '#ffffff',
+        glyphColor: '#ffffff',
+        glyphText: '•',
+      })
+      marker = new AdvancedMarkerElement({
+        map,
+        position: { lat: location.latitude, lng: location.longitude },
+        title: label,
+        content: pin,
+        gmpClickable: true,
+      })
+      marker.addEventListener('gmp-click', onClick)
+    })
+
+    return () => {
+      active = false
+      if (marker) {
+        marker.removeEventListener('gmp-click', onClick)
+        marker.map = null
+      }
+    }
+  }, [map, location, label, onClick])
+
+  return null
+}
+
+function LoadedGoogleMap({
+  isPlacing,
+  onMapSelect,
+  deviceLocation,
+  onLocationFound,
+  onLocationError,
+  selectedReport,
+  isNearMeActive,
+  nearMeLocation,
+  locationLabel,
+  reports,
+  draftLocation,
+  issueType,
+  confirmedReportIds,
+  confirmingReportIds,
+  confirmationErrors,
+  confirmationSetupError,
+  onConfirm,
+}: GoogleMapSurfaceProps) {
+  const { isLoaded, loadError } = useJsApiLoader({
+    id: 'google-maps-script',
+    googleMapsApiKey,
+    libraries: googleMapsLibraries,
   })
+  const [map, setMap] = useState<google.maps.Map | null>(null)
+  const [openReportId, setOpenReportId] = useState<string | null>(null)
+  const [locationInfoOpen, setLocationInfoOpen] = useState(false)
+  const [viewport, setViewport] = useState<MapViewport | null>(null)
+  const mapContainerRef = useRef<HTMLDivElement | null>(null)
+  const mapInstanceRef = useRef<google.maps.Map | null>(null)
+  const lastFitTarget = useRef<string | null>(null)
+  const lastViewportKey = useRef<string | null>(null)
+  const visibleReports = useMemo(() => {
+    if (!viewport) return []
+    return reports.filter((report) =>
+      report.latitude >= viewport.south &&
+      report.latitude <= viewport.north &&
+      report.longitude >= viewport.west &&
+      report.longitude <= viewport.east,
+    )
+  }, [reports, viewport])
+  const markerReports = useMemo(() => {
+    if (visibleReports.length <= MAX_RENDERED_REPORT_MARKERS) return visibleReports
+
+    const chronologicalReports = [...visibleReports].sort((first, second) =>
+      Date.parse(first.created_at) - Date.parse(second.created_at),
+    )
+    const interval = (chronologicalReports.length - 1) / (MAX_RENDERED_REPORT_MARKERS - 1)
+    return Array.from({ length: MAX_RENDERED_REPORT_MARKERS }, (_, index) =>
+      chronologicalReports[Math.round(index * interval)],
+    )
+  }, [visibleReports])
+  const mapOptions: google.maps.MapOptions = {
+    minZoom: 10,
+    maxZoom: 18,
+    mapTypeId: 'roadmap',
+    mapId: googleMapsMapId,
+    disableDefaultUI: true,
+    clickableIcons: false,
+    draggableCursor: isPlacing ? 'crosshair' : undefined,
+  }
+
+  useEffect(() => {
+    if (!map || !mapContainerRef.current || typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(() => {
+      const currentCenter = map.getCenter()
+      google.maps.event.trigger(map, 'resize')
+      if (currentCenter) map.setCenter(currentCenter)
+    })
+    observer.observe(mapContainerRef.current)
+    return () => observer.disconnect()
+  }, [map])
+
+  useEffect(() => {
+    if (!map || !selectedReport) return
+    map.panTo({ lat: selectedReport.latitude, lng: selectedReport.longitude })
+    map.setZoom(15)
+  }, [map, selectedReport])
+
+  useEffect(() => {
+    if (!map || !isNearMeActive || !nearMeLocation) {
+      lastFitTarget.current = null
+      return
+    }
+
+    const fitTarget = `${nearMeLocation.latitude},${nearMeLocation.longitude}`
+    if (lastFitTarget.current === fitTarget) return
+    lastFitTarget.current = fitTarget
+
+    if (reports.length > 0) {
+      const bounds = new google.maps.LatLngBounds()
+      bounds.extend({ lat: nearMeLocation.latitude, lng: nearMeLocation.longitude })
+      reports.forEach((report) => bounds.extend({ lat: report.latitude, lng: report.longitude }))
+      map.fitBounds(bounds, 36)
+      google.maps.event.addListenerOnce(map, 'idle', () => {
+        if ((map.getZoom() ?? 0) > 15) map.setZoom(15)
+      })
+    } else {
+      map.setCenter({ lat: nearMeLocation.latitude, lng: nearMeLocation.longitude })
+      map.setZoom(15)
+    }
+  }, [map, isNearMeActive, nearMeLocation, reports])
+
+  if (loadError) {
+    return <div className="map-api-message" role="alert">Google Maps could not load: {loadError.message}</div>
+  }
+  if (!isLoaded) {
+    return <div className="map-api-message" role="status">Loading Google Maps…</div>
+  }
 
   return (
-    <Marker position={[location.latitude, location.longitude]} icon={userIcon}>
-      <Popup>
-        <div className="popup-content">
-          <div className="popup-topline">
-            <span className="popup-dot" style={{ backgroundColor: '#567052' }} />
-            <strong>{label || 'Your location'}</strong>
-          </div>
-        </div>
-      </Popup>
-    </Marker>
+    <div className="google-map-shell" ref={mapContainerRef}>
+      <GoogleMap
+        mapContainerClassName={isPlacing ? 'google-map placing' : 'google-map'}
+        center={initialMapCenter}
+        zoom={13}
+        options={mapOptions}
+        onLoad={(loadedMap) => {
+          mapInstanceRef.current = loadedMap
+          setMap(loadedMap)
+        }}
+        onUnmount={() => {
+          mapInstanceRef.current = null
+          setMap(null)
+        }}
+        onClick={(event) => {
+          if (isPlacing && event.latLng) onMapSelect(event.latLng.lat(), event.latLng.lng())
+        }}
+        onIdle={() => {
+          const currentMap = mapInstanceRef.current
+          if (!currentMap) return
+          const bounds = currentMap.getBounds()
+          if (!bounds) return
+          const northEast = bounds.getNorthEast()
+          const southWest = bounds.getSouthWest()
+          const nextViewport: MapViewport = {
+            north: northEast.lat(),
+            east: northEast.lng(),
+            south: southWest.lat(),
+            west: southWest.lng(),
+            zoom: currentMap.getZoom() ?? 13,
+          }
+          const viewportKey = Object.values(nextViewport).map((value) => value.toFixed(4)).join(',')
+          if (lastViewportKey.current === viewportKey) return
+          lastViewportKey.current = viewportKey
+          setViewport(nextViewport)
+        }}
+      >
+        {nearMeLocation && (
+          <>
+            <CircleF
+              center={{ lat: nearMeLocation.latitude, lng: nearMeLocation.longitude }}
+              radius={42}
+              options={{ strokeColor: '#567052', strokeOpacity: 0.7, strokeWeight: 2, fillColor: '#567052', fillOpacity: 0.12, clickable: false }}
+            />
+            {map && (
+              <LocationAdvancedMarker
+                map={map}
+                location={nearMeLocation}
+                label={locationLabel || 'Your location'}
+                onClick={() => setLocationInfoOpen(true)}
+              />
+            )}
+            {locationInfoOpen && (
+              <InfoWindowF
+                position={{ lat: nearMeLocation.latitude, lng: nearMeLocation.longitude }}
+                onCloseClick={() => setLocationInfoOpen(false)}
+              >
+                <div className="popup-content">
+                  <div className="popup-topline">
+                    <span className="popup-dot" style={{ backgroundColor: '#567052' }} />
+                    <strong>{locationLabel || 'Your location'}</strong>
+                  </div>
+                </div>
+              </InfoWindowF>
+            )}
+          </>
+        )}
+        {map && markerReports.map((report) => (
+          <ReportAdvancedMarker
+            key={report.id}
+            map={map}
+            report={report}
+            isOpen={openReportId === report.id}
+            onClick={setOpenReportId}
+            onClose={() => setOpenReportId(null)}
+            hasConfirmed={confirmedReportIds.has(report.id)}
+            isConfirming={confirmingReportIds.has(report.id)}
+            confirmationError={confirmationErrors[report.id] || confirmationSetupError}
+            onConfirm={() => onConfirm(report)}
+          />
+        ))}
+        {draftLocation && (
+          <CircleF
+            center={{ lat: draftLocation.latitude, lng: draftLocation.longitude }}
+            radius={24}
+            options={{ strokeColor: '#282b26', strokeOpacity: 0.85, strokeWeight: 3, fillColor: issueColors[issueType], fillOpacity: 0.5, clickable: false }}
+          />
+        )}
+      </GoogleMap>
+      {map && (
+        <MapControls
+          map={map}
+          location={deviceLocation}
+          onLocationFound={onLocationFound}
+          onLocationError={onLocationError}
+        />
+      )}
+    </div>
   )
 }
 
@@ -831,6 +1107,7 @@ function App() {
   const [confirmationErrors, setConfirmationErrors] = useState<Record<string, string>>({})
   const [confirmationSetupError, setConfirmationSetupError] = useState('')
   const [cityLoading, setCityLoading] = useState(true)
+  const [initialCityLoading, setInitialCityLoading] = useState(true)
   const [reportsLoading, setReportsLoading] = useState(true)
   const [cityError, setCityError] = useState('')
   const [reportsError, setReportsError] = useState('')
@@ -838,7 +1115,13 @@ function App() {
   const [visibleIssueTypes, setVisibleIssueTypes] = useState<IssueType[]>(issueTypes)
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
-  const [timelineRange, setTimelineRange] = useState<{ start: number; end: number } | null>(null)
+  const [timelineStartDate, setTimelineStartDate] = useState(() =>
+    new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10),
+  )
+  const [timelineEndDate, setTimelineEndDate] = useState(() => new Date().toISOString().slice(0, 10))
+  const [selectedTimelineDate, setSelectedTimelineDate] = useState(() => new Date().toISOString().slice(0, 10))
+  const [timelineDisplayMode, setTimelineDisplayMode] = useState<'day' | 'cumulative'>('day')
+  const [historicalIsSampled, setHistoricalIsSampled] = useState(false)
   const [deviceLocation, setDeviceLocation] = useState<Coordinates | null>(null)
   const [nearMeLocation, setNearMeLocation] = useState<Coordinates | null>(null)
   const [isNearMeActive, setIsNearMeActive] = useState(false)
@@ -951,13 +1234,13 @@ function App() {
         if (!active) return
         setCityReports(reports)
         setCityStartDate(startDate)
-        setTimelineRange(null)
       })
       .catch((error: unknown) => {
         if (active) setCityError(error instanceof Error ? error.message : 'Unable to load City of Sacramento data.')
       })
       .finally(() => {
         if (active) setCityLoading(false)
+        if (active) setInitialCityLoading(false)
       })
     return () => {
       active = false
@@ -1018,65 +1301,76 @@ function App() {
     }
     return [...reportsById.values()]
   }, [userReports, cityReports, historicalCityReports])
-  const timelineDates = useMemo(() => createTimelineDates(userReports, cityStartDate), [userReports, cityStartDate])
-  const timelineEndIndex = timelineDates.length - 1
-  const defaultTimelineStartDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
-  let defaultTimelineStartIndex = 0
-  for (let index = 0; index < timelineDates.length; index += 1) {
-    if (timelineDates[index] > defaultTimelineStartDate) break
-    defaultTimelineStartIndex = index
-  }
-  const timelineStartIndex = timelineRange
-    ? Math.min(timelineRange.start, timelineEndIndex)
-    : defaultTimelineStartIndex
-  const timelineSelectedEndIndex = timelineRange
-    ? Math.max(timelineStartIndex, Math.min(timelineRange.end, timelineEndIndex))
-    : timelineEndIndex
-  const timelineStartDate = timelineDates[timelineStartIndex]
-  const timelineEndDate = timelineDates[timelineSelectedEndIndex]
+  const timelineDayCount = daysBetweenDates(timelineStartDate, timelineEndDate)
+  const selectedTimelineOffset = Math.min(
+    timelineDayCount,
+    Math.max(0, daysBetweenDates(timelineStartDate, selectedTimelineDate)),
+  )
+  const activeTimelineDate = addDaysToDate(timelineStartDate, selectedTimelineOffset)
+  const historicalQueryStartDate = timelineDisplayMode === 'cumulative'
+    ? timelineStartDate
+    : activeTimelineDate
+  const historicalQueryEndDate = timelineDisplayMode === 'cumulative'
+    ? timelineEndDate
+    : activeTimelineDate
 
   useEffect(() => {
-    if (!cityStartDate || !timelineStartDate || !timelineEndDate) return
+    if (!cityStartDate || !historicalQueryStartDate || !historicalQueryEndDate) return
 
     let active = true
     const controller = new AbortController()
     setCityLoading(true)
     setCityError('')
-    setHistoricalCityReports([])
+    const timer = window.setTimeout(() => {
+      setHistoricalCityReports([])
+      setHistoricalIsSampled(false)
 
-    fetchHistoricalCityReports(timelineStartDate, timelineEndDate, controller.signal)
-      .then((reports) => {
-        if (active) setHistoricalCityReports(reports)
-      })
-      .catch((error: unknown) => {
-        if (active && !controller.signal.aborted) {
-          setCityError(error instanceof Error ? error.message : 'Unable to load historical City reports.')
-        }
-      })
-      .finally(() => {
-        if (active) setCityLoading(false)
-      })
+      fetchHistoricalCityReports(
+        historicalQueryStartDate,
+        historicalQueryEndDate,
+        controller.signal,
+      )
+        .then(({ reports, sampled }) => {
+          if (active) {
+            setHistoricalCityReports(reports)
+            setHistoricalIsSampled(sampled)
+          }
+        })
+        .catch((error: unknown) => {
+          if (active && !controller.signal.aborted) {
+            setCityError(error instanceof Error ? error.message : 'Unable to load historical City reports.')
+          }
+        })
+        .finally(() => {
+          if (active) setCityLoading(false)
+        })
+    }, 250)
 
     return () => {
       active = false
+      window.clearTimeout(timer)
       controller.abort()
     }
-  }, [cityStartDate, timelineStartDate, timelineEndDate])
+  }, [cityStartDate, historicalQueryStartDate, historicalQueryEndDate])
 
   const summaryReports = useMemo(() => reports.filter((report) =>
     (typeFilter === 'all' || report.issue_type === typeFilter) &&
     visibleIssueTypes.includes(report.issue_type) &&
     (sourceFilter === 'all' || report.source === sourceFilter) &&
-    isWithinDateRange(report, timelineStartDate, timelineEndDate) &&
+    isWithinDateRange(
+      report,
+      timelineDisplayMode === 'cumulative' ? timelineStartDate : activeTimelineDate,
+      activeTimelineDate,
+    ) &&
     (!isNearMeActive || !nearMeLocation || distanceInKilometers(nearMeLocation, report) <= NEARBY_RADIUS_KM),
-  ), [reports, typeFilter, visibleIssueTypes, sourceFilter, timelineStartDate, timelineEndDate, isNearMeActive, nearMeLocation])
+  ), [reports, typeFilter, visibleIssueTypes, sourceFilter, timelineStartDate, activeTimelineDate, timelineDisplayMode, isNearMeActive, nearMeLocation])
 
   const filteredReports = useMemo(() => summaryReports.filter((report) =>
-    (statusFilter === 'resolved'
-      ? report.status === 'resolved'
-      : (report.status !== 'resolved' || (statusFilter === 'all' && report.id === selectedMyReportId)) &&
-        (statusFilter === 'all' || statusFilter === 'needs-attention' || report.status === statusFilter)),
-  ), [summaryReports, statusFilter, selectedMyReportId])
+    statusFilter === 'all' ||
+    (statusFilter === 'needs-attention'
+      ? report.status === 'open' || report.status === 'in-progress'
+      : report.status === statusFilter),
+  ), [summaryReports, statusFilter])
 
   const myReports = useMemo(
     () => userReports.filter((report) => report.source === 'user').slice(0, 20),
@@ -1088,9 +1382,9 @@ function App() {
     [myReports, selectedMyReportId],
   )
 
-  const openCount = summaryReports.filter((report) => report.status !== 'resolved').length
-  const resolvedCount = summaryReports.length - openCount
-  const isLoading = cityLoading || reportsLoading
+  const openCount = summaryReports.filter((report) => report.status === 'open' || report.status === 'in-progress').length
+  const resolvedCount = summaryReports.filter((report) => report.status === 'resolved').length
+  const isLoading = initialCityLoading || reportsLoading
 
   async function confirmReport(report: Report) {
     if (report.source !== 'user') return
@@ -1150,6 +1444,22 @@ function App() {
 
   function toggleStatusFilter(nextFilter: StatusFilter) {
     setStatusFilter((current) => current === nextFilter ? 'all' : nextFilter)
+  }
+
+  function changeTimelineStart(date: string) {
+    if (!date) return
+    const nextEndDate = date > timelineEndDate ? date : timelineEndDate
+    setTimelineStartDate(date)
+    setTimelineEndDate(nextEndDate)
+    setSelectedTimelineDate((current) => current < date ? date : current > nextEndDate ? nextEndDate : current)
+  }
+
+  function changeTimelineEnd(date: string) {
+    if (!date) return
+    const nextStartDate = date < timelineStartDate ? date : timelineStartDate
+    setTimelineStartDate(nextStartDate)
+    setTimelineEndDate(date)
+    setSelectedTimelineDate((current) => current < nextStartDate ? nextStartDate : current > date ? date : current)
   }
 
   async function searchAddress(event: FormEvent<HTMLFormElement>) {
@@ -1224,16 +1534,10 @@ function App() {
     setSourceFilter('all')
     setStatusFilter('all')
     const reportDate = report.created_at.slice(0, 10)
-    let start = 0
-    let end = timelineEndIndex
-    for (let index = 0; index < timelineDates.length; index += 1) {
-      if (timelineDates[index] <= reportDate) start = index
-      if (timelineDates[index] >= reportDate) {
-        end = index
-        break
-      }
-    }
-    setTimelineRange({ start, end })
+    setTimelineStartDate(reportDate)
+    setTimelineEndDate(reportDate)
+    setSelectedTimelineDate(reportDate)
+    setTimelineDisplayMode('day')
     setIsNearMeActive(false)
     setSelectedMyReportId(reportId)
     setMyReportsOpen(false)
@@ -1502,21 +1806,21 @@ function App() {
 
       <main className="workspace">
         <aside className="sidebar">
-          <section className="stats-grid" aria-label="Report statistics">
+          <section className="stats-grid" aria-label="Report statistics" aria-busy={isLoading}>
             <button type="button" className={`stat-card stat-total ${statusFilter === 'all' ? 'active' : ''}`} onClick={() => toggleStatusFilter('all')}>
               <span className="stat-label">ON THE MAP</span>
-              <strong>{isLoading ? '—' : summaryReports.length.toLocaleString()}</strong>
-              <span className="stat-caption">total reports</span>
+              <strong>{summaryReports.length.toLocaleString()}</strong>
+              <span className="stat-caption">{isLoading ? 'updating…' : 'total reports'}</span>
             </button>
             <button type="button" className={`stat-card ${statusFilter === 'needs-attention' ? 'active' : ''}`} onClick={() => toggleStatusFilter('needs-attention')}>
               <span className="stat-label">NEEDS ATTENTION</span>
-              <strong>{isLoading ? '—' : openCount.toLocaleString()}</strong>
-              <span className="stat-caption">open issues</span>
+              <strong>{openCount.toLocaleString()}</strong>
+              <span className="stat-caption">{isLoading ? 'updating…' : 'open issues'}</span>
             </button>
             <button type="button" className={`stat-card ${statusFilter === 'resolved' ? 'active' : ''}`} onClick={() => toggleStatusFilter('resolved')}>
               <span className="stat-label">TAKEN CARE OF</span>
-              <strong>{isLoading ? '—' : resolvedCount.toLocaleString()}</strong>
-              <span className="stat-caption">resolved</span>
+              <strong>{resolvedCount.toLocaleString()}</strong>
+              <span className="stat-caption">{isLoading ? 'updating…' : 'resolved'}</span>
             </button>
           </section>
 
@@ -1625,57 +1929,84 @@ function App() {
                     <option value="open">Open</option>
                     <option value="in-progress">In progress</option>
                     <option value="resolved">Resolved</option>
+                    <option value="cancelled">Cancelled</option>
                   </select>
                   <ChevronDown size={15} />
                 </div>
               </div>
             </div>
-            <section className="timeline-section" aria-label="Filter currently unresolved reports by date">
+            <section className="timeline-section" aria-label="Filter reports by date">
               <div className="timeline-heading">
-                <span className="field-label">NEEDS ATTENTION TIMELINE</span>
-                <span className="timeline-step-note">1st · 15th · month end</span>
+                <span className="field-label">REPORT TIMELINE</span>
               </div>
-              <div className="timeline-dates" aria-live="polite">
-                <span><small>START</small>{formatTimelineDate(timelineStartDate)}</span>
-                <span><small>END</small>{formatTimelineDate(timelineEndDate)}</span>
+              <div className="timeline-date-bounds">
+                <label>
+                  <span className="field-label">START</span>
+                  <input
+                    aria-label="Timeline start date"
+                    type="date"
+                    max={timelineEndDate}
+                    value={timelineStartDate}
+                    onChange={(event) => changeTimelineStart(event.target.value)}
+                  />
+                </label>
+                <label>
+                  <span className="field-label">END</span>
+                  <input
+                    aria-label="Timeline end date"
+                    type="date"
+                    min={timelineStartDate}
+                    max={new Date().toISOString().slice(0, 10)}
+                    value={timelineEndDate}
+                    onChange={(event) => changeTimelineEnd(event.target.value)}
+                  />
+                </label>
               </div>
+              <div className="timeline-selected-date" aria-live="polite">{formatTimelineDate(activeTimelineDate)}</div>
               <div className="timeline-range">
                 <div className="timeline-track" />
-                <div
-                  className="timeline-track-selected"
-                  style={{
-                    left: `${timelineEndIndex ? timelineStartIndex / timelineEndIndex * 100 : 0}%`,
-                    right: `${timelineEndIndex ? (timelineEndIndex - timelineSelectedEndIndex) / timelineEndIndex * 100 : 0}%`,
-                  }}
-                />
                 <input
-                  aria-label="Start date"
-                  aria-valuetext={formatTimelineDate(timelineStartDate)}
+                  aria-label="Select timeline day"
+                  aria-valuetext={formatTimelineDate(activeTimelineDate)}
                   type="range"
                   min={0}
-                  max={timelineEndIndex}
-                  value={timelineStartIndex}
-                  disabled={!cityStartDate || timelineEndIndex === 0}
-                  onChange={(event) => setTimelineRange({
-                    start: Math.min(Number(event.target.value), timelineSelectedEndIndex),
-                    end: timelineSelectedEndIndex,
-                  })}
-                />
-                <input
-                  aria-label="End date"
-                  aria-valuetext={formatTimelineDate(timelineEndDate)}
-                  type="range"
-                  min={0}
-                  max={timelineEndIndex}
-                  value={timelineSelectedEndIndex}
-                  disabled={!cityStartDate || timelineEndIndex === 0}
-                  onChange={(event) => setTimelineRange({
-                    start: timelineStartIndex,
-                    end: Math.max(Number(event.target.value), timelineStartIndex),
-                  })}
+                  max={timelineDayCount}
+                  value={selectedTimelineOffset}
+                  disabled={timelineDayCount === 0}
+                  onChange={(event) => setSelectedTimelineDate(addDaysToDate(timelineStartDate, Number(event.target.value)))}
                 />
               </div>
-              <p className="timeline-caption">Currently unresolved issues created in this range. Drag the handles to explore the timeline.</p>
+              <div className="timeline-mode-toggle" role="group" aria-label="Timeline display mode">
+                <button
+                  type="button"
+                  aria-pressed={timelineDisplayMode === 'day'}
+                  onClick={() => setTimelineDisplayMode('day')}
+                >
+                  Show issues of the day
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={timelineDisplayMode === 'cumulative'}
+                  onClick={() => setTimelineDisplayMode('cumulative')}
+                >
+                  Show issues cumulatively
+                </button>
+              </div>
+              <p className="timeline-caption">
+                {timelineDisplayMode === 'cumulative'
+                  ? 'Showing issues reported from the start date through the selected day.'
+                  : 'Showing issues reported on the selected day.'}
+              </p>
+              {historicalIsSampled && (
+                <p className="timeline-caption" role="status">
+                  Showing up to {MAX_CUMULATIVE_REPORTS.toLocaleString()} reports sampled across the selected dates; counts reflect this sample.
+                </p>
+              )}
+              {filteredReports.length > MAX_RENDERED_REPORT_MARKERS && (
+                <p className="timeline-caption" role="status">
+                  The map displays up to {MAX_RENDERED_REPORT_MARKERS.toLocaleString()} markers at a time.
+                </p>
+              )}
             </section>
           </section>
 
@@ -1753,25 +2084,9 @@ function App() {
         </aside>
 
         <section className="map-panel" aria-label="Sacramento infrastructure map">
-          <MapContainer
-            center={[38.5816, -121.4944]}
-            zoom={13}
-            minZoom={10}
-            maxZoom={18}
-            preferCanvas
-            scrollWheelZoom
-            className={isPlacing ? 'leaflet-map placing' : 'leaflet-map'}
-            zoomControl={false}
-          >
-            <TileLayer
-              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &middot; Tiles &copy; <a href="https://carto.com/attributions">CARTO</a>'
-              url={cartoBasemapKey
-                ? `https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png?key=${encodeURIComponent(cartoBasemapKey)}`
-                : 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png'}
-              subdomains={cartoBasemapKey ? 'abcd' : 'abc'}
-            />
-            <MapSizeInvalidator />
-            <MapClickHandler enabled={isPlacing} onSelect={async (latitude, longitude) => {
+          <GoogleMapSurface
+            isPlacing={isPlacing}
+            onMapSelect={async (latitude, longitude) => {
               const location = { latitude, longitude }
               setDraftLocation(location)
               setFormError('')
@@ -1779,46 +2094,27 @@ function App() {
               setAddressQuery(await getLocationAddressLabel(location))
               setReportPanelOpen(true)
               setIsPlacing(false)
-            }} />
-            <MapControls
-              location={deviceLocation}
-              onLocationFound={(location) => {
-                setDeviceLocation(location)
-                setNearMeLocation(location)
-                setAddressQuery('Your location')
-              }}
-              onLocationError={setNearMeError}
-            />
-            <MyReportsMapController report={selectedMyReport} />
-            <NearbyMapController active={isNearMeActive} location={nearMeLocation} reports={filteredReports} />
-            {nearMeLocation && (
-              <>
-                <CircleMarker
-                  center={[nearMeLocation.latitude, nearMeLocation.longitude]}
-                  radius={16}
-                  pathOptions={{ color: '#567052', fillColor: '#ffffff', fillOpacity: 0.92, weight: 3 }}
-                />
-                <UserLocationMarker location={nearMeLocation} label={addressQuery || 'Your location'} />
-              </>
-            )}
-            {filteredReports.map((report) => (
-              <ReportMarker
-                key={report.id}
-                report={report}
-                hasConfirmed={confirmedReportIds.has(report.id)}
-                isConfirming={confirmingReportIds.has(report.id)}
-                confirmationError={confirmationErrors[report.id] || confirmationSetupError}
-                onConfirm={() => void confirmReport(report)}
-              />
-            ))}
-            {draftLocation && (
-              <CircleMarker
-                center={[draftLocation.latitude, draftLocation.longitude]}
-                radius={11}
-                pathOptions={{ color: '#282b26', fillColor: issueColors[issueType], fillOpacity: 0.5, weight: 3, dashArray: '4 5' }}
-              />
-            )}
-          </MapContainer>
+            }}
+            deviceLocation={deviceLocation}
+            onLocationFound={(location) => {
+              setDeviceLocation(location)
+              setNearMeLocation(location)
+              setAddressQuery('Your location')
+            }}
+            onLocationError={setNearMeError}
+            selectedReport={selectedMyReport}
+            isNearMeActive={isNearMeActive}
+            nearMeLocation={nearMeLocation}
+            locationLabel={addressQuery || 'Your location'}
+            reports={filteredReports}
+            draftLocation={draftLocation}
+            issueType={issueType}
+            confirmedReportIds={confirmedReportIds}
+            confirmingReportIds={confirmingReportIds}
+            confirmationErrors={confirmationErrors}
+            confirmationSetupError={confirmationSetupError}
+            onConfirm={(report) => void confirmReport(report)}
+          />
           <div className="map-fab-stack">
             <button className={`top-report-button map-report-button ${isPlacing ? 'active' : ''}`} onClick={isPlacing ? cancelPlacing : startPlacing} type="button" aria-label={isPlacing ? 'Cancel report' : 'Report an issue'}>
               {isPlacing ? <X size={15} /> : <Plus size={16} />}
@@ -1967,7 +2263,10 @@ function App() {
             <div className="map-instruction"><MapPin size={15} /> Location selected — complete the report below</div>
           )}
           {cityLoading && <div className="map-loading"><span className="button-spinner" /> Loading public records</div>}
-          {filteredReports.length === 0 && !isLoading && !cityError && (
+          {filteredReports.length === 0 && !cityError && (cityLoading || isLoading) && (
+            <div className="empty-map" role="status"><span className="button-spinner" /><strong>Loading in progress</strong></div>
+          )}
+          {filteredReports.length === 0 && !cityLoading && !isLoading && !cityError && (
             <div className="empty-map"><MapPin size={18} /><strong>Nothing to show here</strong><span>Try adjusting your filters or add a report.</span></div>
           )}
         </section>
